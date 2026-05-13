@@ -71,6 +71,15 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
     }
 
     public func stop(reason: LiveStreamState.StopReason = .requested) async {
+        // No-op from terminal/initial states — only `.live` / `.preparing` can be stopped.
+        let shouldProceed = state.withLock { pipeline -> Bool in
+            switch pipeline.liveState {
+            case .live, .preparing: return true
+            default: return false
+            }
+        }
+        guard shouldProceed else { return }
+
         let snapshot: (LiveStreamUploader?, LiveStreamSession?, HLSSegmenter?) = state.withLock { pipeline in
             (pipeline.uploader, pipeline.session, pipeline.segmenter)
         }
