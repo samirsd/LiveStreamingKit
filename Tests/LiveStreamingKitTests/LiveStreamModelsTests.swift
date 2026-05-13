@@ -130,9 +130,9 @@ final class LiveStreamModelsTests: XCTestCase {
     func testLiveStreamStateLiveEqualityIgnoresDate() {
         let session = LiveStreamSession(
             id: "x", ingestToken: "t",
-            ingestURL: URL(string: "https://e.com")!,
-            listenerURL: URL(string: "https://e.com")!,
-            masterPlaylistURL: URL(string: "https://e.com")!
+            ingestURL: URL(string: "https://example.com")!,
+            listenerURL: URL(string: "https://example.com")!,
+            masterPlaylistURL: URL(string: "https://example.com")!
         )
         let date = Date()
         let a = LiveStreamState.live(session: session, since: date)
@@ -143,7 +143,7 @@ final class LiveStreamModelsTests: XCTestCase {
     }
 
     func testLiveStreamStateFailedComparesUnderlyingError() {
-        let url = URL(string: "https://e.com")!
+        let url = URL(string: "https://example.com")!
         XCTAssertEqual(
             LiveStreamState.failed(.backendUnreachable(url)),
             LiveStreamState.failed(.backendUnreachable(url))
