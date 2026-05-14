@@ -63,6 +63,7 @@ final class LiveStreamModelsTests: XCTestCase {
         XCTAssertEqual(config.maxSegmentRetries, 3)
         XCTAssertEqual(config.maxBufferedSegments, 12)
         XCTAssertEqual(config.channelMap, .interleavedStereoMixdown)
+        XCTAssertEqual(config.aiMixMode, .off)
     }
 
     func testLiveStreamConfigEqualityIgnoresTokenProvider() {
@@ -76,6 +77,13 @@ final class LiveStreamModelsTests: XCTestCase {
         let url = URL(string: "https://example.com")!
         let a = LiveStreamConfig(ingestBaseURL: url, authTokenProvider: { nil }, stereoBitrate: 128_000)
         let b = LiveStreamConfig(ingestBaseURL: url, authTokenProvider: { nil }, stereoBitrate: 64_000)
+        XCTAssertNotEqual(a, b)
+    }
+
+    func testLiveStreamConfigEqualityDetectsDifferentAIMixMode() {
+        let url = URL(string: "https://example.com")!
+        let a = LiveStreamConfig(ingestBaseURL: url, authTokenProvider: { nil }, aiMixMode: .off)
+        let b = LiveStreamConfig(ingestBaseURL: url, authTokenProvider: { nil }, aiMixMode: .broadcastPolish)
         XCTAssertNotEqual(a, b)
     }
 

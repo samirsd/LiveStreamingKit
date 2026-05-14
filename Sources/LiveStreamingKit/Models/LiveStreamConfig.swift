@@ -9,6 +9,7 @@ public struct LiveStreamConfig: Sendable, Equatable {
     public var stereoBitrate: Int
     public var segmentDuration: TimeInterval
     public var channelMap: ChannelMap
+    public var aiMixMode: LiveStreamAIMixMode
     public var maxSegmentRetries: Int
     public var maxBufferedSegments: Int
 
@@ -21,6 +22,7 @@ public struct LiveStreamConfig: Sendable, Equatable {
         stereoBitrate: Int = 128_000,
         segmentDuration: TimeInterval = 4.0,
         channelMap: ChannelMap = .interleavedStereoMixdown,
+        aiMixMode: LiveStreamAIMixMode = .off,
         maxSegmentRetries: Int = 3,
         maxBufferedSegments: Int = 12
     ) {
@@ -32,6 +34,7 @@ public struct LiveStreamConfig: Sendable, Equatable {
         self.stereoBitrate = stereoBitrate
         self.segmentDuration = segmentDuration
         self.channelMap = channelMap
+        self.aiMixMode = aiMixMode
         self.maxSegmentRetries = maxSegmentRetries
         self.maxBufferedSegments = maxBufferedSegments
     }
@@ -44,9 +47,15 @@ public struct LiveStreamConfig: Sendable, Equatable {
             && lhs.stereoBitrate == rhs.stereoBitrate
             && lhs.segmentDuration == rhs.segmentDuration
             && lhs.channelMap == rhs.channelMap
+            && lhs.aiMixMode == rhs.aiMixMode
             && lhs.maxSegmentRetries == rhs.maxSegmentRetries
             && lhs.maxBufferedSegments == rhs.maxBufferedSegments
     }
+}
+
+public enum LiveStreamAIMixMode: String, Codable, Sendable, Equatable, CaseIterable {
+    case off
+    case broadcastPolish
 }
 
 public struct ChannelMap: Sendable, Equatable {

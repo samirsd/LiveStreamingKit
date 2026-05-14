@@ -1,18 +1,29 @@
 import Foundation
-import AVFoundation
+@preconcurrency import AVFoundation
+import AIMixKit
 import os
 
 public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
     public typealias EventHandler = @Sendable (LiveStreamEvent) -> Void
 
-    private struct PipelineState {
+    private struct PipelineState: @unchecked Sendable {
         var liveState: LiveStreamState = .idle
         var session: LiveStreamSession?
         var uploader: LiveStreamUploader?
         var sourceFormat: AVAudioFormat?
         var downmixer: StereoDownmixer?
+        var aiMixProcessor: AIMixProcessor?
         var encoder: AACEncoder?
         var segmenter: HLSSegmenter?
+
+        func aiMixProcessorIsReady(for mode: LiveStreamAIMixMode) -> Bool {
+            switch mode {
+            case .off:
+                return aiMixProcessor == nil
+            case .broadcastPolish:
+                return aiMixProcessor != nil
+            }
+        }
     }
 
     private let config: LiveStreamConfig
@@ -122,16 +133,29 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
 
         ensurePipelineReady(for: buffer)
 
-        let pipeline: (StereoDownmixer?, AACEncoder?, HLSSegmenter?, LiveStreamUploader?) = state.withLock { pipeline in
-            (pipeline.downmixer, pipeline.encoder, pipeline.segmenter, pipeline.uploader)
+        let pipeline: (StereoDownmixer?, AIMixProcessor?, AACEncoder?, HLSSegmenter?, LiveStreamUploader?) = state.withLock { pipeline in
+            (pipeline.downmixer, pipeline.aiMixProcessor, pipeline.encoder, pipeline.segmenter, pipeline.uploader)
         }
         guard let downmixer = pipeline.0,
-              let encoder = pipeline.1,
-              let segmenter = pipeline.2,
-              let uploader = pipeline.3 else { return }
+              let encoder = pipeline.2,
+              let segmenter = pipeline.3,
+              let uploader = pipeline.4 else { return }
         guard let stereo = downmixer.downmix(buffer) else { return }
+        let streamBuffer: AVAudioPCMBuffer
+        if let aiMixProcessor = pipeline.1,
+           let processed = aiMixProcessor.process(stereo, at: sampleTime) {
+            streamBuffer = processed.buffer
+            onEvent(.aiMixMeasured(
+                inputRMSDB: processed.snapshot.inputRMSDB,
+                outputPeakDB: processed.snapshot.outputPeakDB,
+                appliedGainDB: processed.snapshot.appliedGainDB,
+                limiterGainReductionDB: processed.snapshot.limiterGainReductionDB
+            ))
+        } else {
+            streamBuffer = stereo
+        }
         do {
-            let packets = try encoder.encode(stereo)
+            let packets = try encoder.encode(streamBuffer)
             for packet in packets {
                 if let segment = segmenter.append(packet) {
                     onEvent(.segmentEncoded(
@@ -155,6 +179,7 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
                existing.sampleRate == inputSampleRate,
                existing.channelCount == inputChannelCount,
                pipeline.downmixer != nil,
+               pipeline.aiMixProcessorIsReady(for: config.aiMixMode),
                pipeline.encoder != nil,
                pipeline.segmenter != nil {
                 return false
@@ -171,6 +196,7 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
             sampleRate: config.sampleRate,
             bitrate: config.stereoBitrate
         ) else { return }
+        let aiMixProcessor = Self.makeAIMixProcessor(mode: config.aiMixMode)
         let segmenter = HLSSegmenter(
             targetDuration: config.segmentDuration,
             sampleRate: config.sampleRate,
@@ -180,8 +206,18 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
         state.withLock { pipeline in
             pipeline.sourceFormat = sourceFormat
             pipeline.downmixer = downmixer
+            pipeline.aiMixProcessor = aiMixProcessor
             pipeline.encoder = encoder
             pipeline.segmenter = segmenter
+        }
+    }
+
+    private static func makeAIMixProcessor(mode: LiveStreamAIMixMode) -> AIMixProcessor? {
+        switch mode {
+        case .off:
+            return nil
+        case .broadcastPolish:
+            return AIMixProcessor(configuration: .broadcastPolish)
         }
     }
 

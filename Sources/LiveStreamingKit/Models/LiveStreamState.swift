@@ -18,6 +18,12 @@ public enum LiveStreamState: Sendable, Equatable {
 
 public enum LiveStreamEvent: Sendable, Equatable {
     case stateChanged(LiveStreamState)
+    case aiMixMeasured(
+        inputRMSDB: Float,
+        outputPeakDB: Float,
+        appliedGainDB: Float,
+        limiterGainReductionDB: Float
+    )
     case segmentEncoded(sequence: Int, bytes: Int, duration: TimeInterval)
     case segmentUploaded(sequence: Int, bytes: Int, durationMs: Int)
     case segmentRetrying(sequence: Int, attempt: Int)

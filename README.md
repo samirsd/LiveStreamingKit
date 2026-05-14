@@ -7,7 +7,7 @@ Live-native multitrack audio streaming for Carnyx. While `RecordKit` writes isol
 ```
 inputs (n channels)
   ├─► RecordKit (isolated stems on disk)
-  └─► LiveStreamingKit (StereoDownmixer ─► AACEncoder ─► HLSSegmenter ─► Uploader)
+  └─► LiveStreamingKit (StereoDownmixer ─► optional AIMixKit polish ─► AACEncoder ─► HLSSegmenter ─► Uploader)
 ```
 
 The session itself is a durable multitrack recording. The livestream is a temporary realtime view of a permanent session.
@@ -15,7 +15,7 @@ The session itself is a durable multitrack recording. The livestream is a tempor
 ## Public API
 
 - `LiveStreamEngine` — state machine; owns the encoder/segmenter/uploader; observes audio frames.
-- `LiveStreamConfig` — bitrate, sample rate, segment duration, backend endpoint, channel map.
+- `LiveStreamConfig` — bitrate, sample rate, segment duration, backend endpoint, channel map, optional AI mix mode.
 - `LiveStreamSession` — ingest descriptor returned by the backend (id, ingest urls, listener url).
 - `LiveStreamState` / `LiveStreamEvent` — async stream consumed by UI.
 - `LiveStreamError` — failure cases.
