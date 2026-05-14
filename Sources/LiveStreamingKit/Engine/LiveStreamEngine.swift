@@ -29,6 +29,7 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
     private let config: LiveStreamConfig
     private let client: LiveStreamClient
     private let onEvent: EventHandler
+    private let socialPoller: LiveStreamSocialPoller
     private let state = OSAllocatedUnfairLock(initialState: PipelineState())
     private let processingQueue = DispatchQueue(label: "carnyx.livestream.engine", qos: .userInitiated)
 
@@ -46,8 +47,14 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
         onEvent: @escaping EventHandler
     ) {
         self.config = config
-        self.client = LiveStreamClient(config: config, transport: transport)
+        let client = LiveStreamClient(config: config, transport: transport)
+        self.client = client
         self.onEvent = onEvent
+        // The poller forwards engagement events through the same `onEvent`
+        // sink the encoder/uploader uses, so consumers don't need to wire a
+        // second channel. The poller is dormant until `start()` hands it a
+        // session.
+        self.socialPoller = LiveStreamSocialPoller(client: client, onEvent: onEvent)
     }
 
     public func start() async throws -> LiveStreamSession {
@@ -73,6 +80,12 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
                 pipeline.uploader = uploader
             }
             try transition { _ in .live(session: newSession, since: Date()) }
+            // Start polling for listener / reaction stats. The poller is an
+            // actor so this is fire-and-forget — failures degrade silently
+            // and never affect the audio pipeline.
+            Task { [socialPoller] in
+                await socialPoller.start(newSession)
+            }
             return newSession
         } catch {
             let mapped = mapStartError(error)
@@ -90,6 +103,10 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
             }
         }
         guard shouldProceed else { return }
+
+        // Stop the social poller first so the broadcaster's view stops
+        // accumulating counts while the encoder flushes its tail.
+        await socialPoller.stop()
 
         let snapshot: (LiveStreamUploader?, LiveStreamSession?, HLSSegmenter?) = state.withLock { pipeline in
             (pipeline.uploader, pipeline.session, pipeline.segmenter)
