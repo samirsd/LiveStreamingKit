@@ -148,13 +148,13 @@ public actor LiveStreamClient {
         _ session: LiveStreamSession,
         since: TimeInterval? = nil
     ) async -> ReactionsResponse? {
-        var components = URLComponents()
-        components.path = "/api/v1/livestream/sessions/\(session.id)/reactions/"
+        var path = "/api/v1/livestream/sessions/\(session.id)/reactions/"
         if let since {
-            components.queryItems = [URLQueryItem(name: "since", value: "\(since)")]
+            // `since` ts is a UNIX double; URL-encode just to be safe.
+            let value = "\(since)".addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "\(since)"
+            path += "?since=\(value)"
         }
-        guard let relative = components.url,
-              let url = URL(string: relative.relativeString, relativeTo: config.ingestBaseURL)?.absoluteURL else {
+        guard let url = URL(string: path, relativeTo: config.ingestBaseURL)?.absoluteURL else {
             return nil
         }
         var request = URLRequest(url: url)
