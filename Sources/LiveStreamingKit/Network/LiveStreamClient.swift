@@ -67,6 +67,14 @@ public actor LiveStreamClient {
         self.transport = transport
     }
 
+    /// The base URL this client targets. Exposed for listener-side
+    /// consumers that need to resolve relative paths (master playlist, OG
+    /// image, etc.) against the same host. Use `nonisolated` since `config`
+    /// is immutable after init.
+    public nonisolated var baseURL: URL {
+        config.ingestBaseURL
+    }
+
     public func createSession() async throws -> LiveStreamSession {
         let request = try await buildJSONRequest(
             path: "/api/v1/livestream/sessions/",
@@ -134,6 +142,34 @@ public actor LiveStreamClient {
             let (data, response) = try await transport.perform(request)
             guard (200..<300).contains(response.statusCode) else { return nil }
             return try JSONDecoder().decode(SessionStatusResponse.self, from: data)
+        } catch {
+            return nil
+        }
+    }
+
+    /// Fire a single reaction against a live session. Anonymous on the
+    /// backend — no auth header is sent. Returns the server-acknowledged
+    /// record on success, or `nil` on any failure (network, decode, or
+    /// rejection). UI callers typically render an optimistic floating emoji
+    /// before awaiting this, so a transient failure is recoverable.
+    public func postReaction(
+        _ session: LiveStreamSession,
+        type: String
+    ) async -> LiveReactionEvent? {
+        let path = "/api/v1/livestream/sessions/\(session.id)/reactions/"
+        guard let url = URL(string: path, relativeTo: config.ingestBaseURL)?.absoluteURL else {
+            return nil
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.httpBody = try? JSONEncoder().encode(["type": type])
+        do {
+            let (data, response) = try await transport.perform(request)
+            guard (200..<300).contains(response.statusCode) else { return nil }
+            let dto = try JSONDecoder().decode(ReactionDTO.self, from: data)
+            return LiveReactionEvent(id: dto.id, type: dto.type, ts: dto.ts)
         } catch {
             return nil
         }

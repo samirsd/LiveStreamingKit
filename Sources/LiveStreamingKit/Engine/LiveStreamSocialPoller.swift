@@ -1,7 +1,12 @@
 import Foundation
 
-/// Background poller that surfaces broadcaster-facing engagement signals
-/// during a live session.
+/// Background poller for live-session engagement signals.
+///
+/// Used on both sides of the loop:
+/// - **Broadcaster** — started by `LiveStreamEngine` when going live, drives
+///   the listener count / reaction overlays on the control sheet.
+/// - **Listener** — driven by `LiveStreamListenerViewModel` so an in-app
+///   listener sees the same counts and reactions stream as the web page.
 ///
 /// Two independent loops run while the poller is active:
 ///
@@ -16,7 +21,7 @@ import Foundation
 /// (the underlying `fetchSessionStatus` / `fetchReactions` return `nil` on
 /// any error). Each loop self-terminates when ``stop()`` is called or when
 /// its task is cancelled.
-actor LiveStreamSocialPoller {
+public actor LiveStreamSocialPoller {
     private let client: LiveStreamClient
     private let onEvent: @Sendable (LiveStreamEvent) -> Void
     private let statusInterval: TimeInterval
@@ -33,7 +38,7 @@ actor LiveStreamSocialPoller {
     private var lastPeakListenerCount: Int = -1
     private var lastReactionTotalsSignature: String = ""
 
-    init(
+    public init(
         client: LiveStreamClient,
         statusInterval: TimeInterval = 5.0,
         reactionsInterval: TimeInterval = 1.0,
@@ -48,7 +53,7 @@ actor LiveStreamSocialPoller {
     /// Begin polling for the given session. Idempotent — calling again with
     /// the same session does nothing; calling with a new session cancels the
     /// previous loops and restarts.
-    func start(_ session: LiveStreamSession) {
+    public func start(_ session: LiveStreamSession) {
         if self.session?.id == session.id, statusTask != nil { return }
         cancelTasks()
         resetSeen()
@@ -65,7 +70,12 @@ actor LiveStreamSocialPoller {
     }
 
     /// Stop both loops. Safe to call multiple times.
-    func stop() {
+    public func stop() {
+        cancelPolling()
+    }
+
+    /// Stop both loops. Safe to call multiple times.
+    public func cancelPolling() {
         cancelTasks()
         session = nil
     }
