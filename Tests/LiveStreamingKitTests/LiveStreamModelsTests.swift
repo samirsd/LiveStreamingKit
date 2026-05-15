@@ -61,9 +61,16 @@ final class LiveStreamModelsTests: XCTestCase {
         XCTAssertEqual(config.stereoBitrate, 128_000)
         XCTAssertEqual(config.segmentDuration, 4.0)
         XCTAssertEqual(config.maxSegmentRetries, 3)
-        XCTAssertEqual(config.maxBufferedSegments, 12)
+        // Default buffer holds ~60s of audio at the default 4s cadence —
+        // sized to absorb a minute-long network outage without dropping.
+        XCTAssertEqual(config.maxBufferedSegments, 15)
         XCTAssertEqual(config.channelMap, .interleavedStereoMixdown)
         XCTAssertEqual(config.aiMixMode, .off)
+        // Reliability defaults: a single segment has a generous wall-clock
+        // budget to retry through transient failures, and individual
+        // backoff steps are capped so subsequent segments don't starve.
+        XCTAssertEqual(config.segmentDeliveryBudgetSeconds, 60)
+        XCTAssertEqual(config.maxRetryBackoffSeconds, 5)
     }
 
     func testLiveStreamConfigEqualityIgnoresTokenProvider() {

@@ -76,27 +76,41 @@ public actor LiveStreamClient {
     }
 
     public func createSession() async throws -> LiveStreamSession {
-        let request = try await buildJSONRequest(
-            path: "/api/v1/livestream/sessions/",
-            method: "POST",
-            body: CreateSessionRequest(
-                multitrackRecordingID: config.multitrackRecordingID,
-                title: config.title,
-                segmentDuration: config.segmentDuration,
-                sampleRate: Int(config.sampleRate),
-                stereoBitrate: config.stereoBitrate
+        let endpoint = config.ingestBaseURL.appendingPathComponent("api/v1/livestream/sessions/")
+        LiveStreamLog.client.info(
+            "createSession POST \(endpoint.absoluteString, privacy: .public)"
+        )
+        do {
+            let request = try await buildJSONRequest(
+                path: "/api/v1/livestream/sessions/",
+                method: "POST",
+                body: CreateSessionRequest(
+                    multitrackRecordingID: config.multitrackRecordingID,
+                    title: config.title,
+                    segmentDuration: config.segmentDuration,
+                    sampleRate: Int(config.sampleRate),
+                    stereoBitrate: config.stereoBitrate
+                )
             )
-        )
-        let (data, response) = try await transport.perform(request)
-        try ensureSuccess(response, data: data)
-        let decoded = try JSONDecoder.iso8601().decode(CreateSessionResponse.self, from: data)
-        return LiveStreamSession(
-            id: decoded.id,
-            ingestToken: decoded.ingest_token,
-            ingestURL: try url(decoded.ingest_url),
-            listenerURL: try url(decoded.listener_url),
-            masterPlaylistURL: try url(decoded.master_playlist_url)
-        )
+            let (data, response) = try await transport.perform(request)
+            LiveStreamLog.client.info(
+                "createSession response status=\(response.statusCode, privacy: .public) bytes=\(data.count, privacy: .public)"
+            )
+            try ensureSuccess(response, data: data)
+            let decoded = try JSONDecoder.iso8601().decode(CreateSessionResponse.self, from: data)
+            return LiveStreamSession(
+                id: decoded.id,
+                ingestToken: decoded.ingest_token,
+                ingestURL: try url(decoded.ingest_url),
+                listenerURL: try url(decoded.listener_url),
+                masterPlaylistURL: try url(decoded.master_playlist_url)
+            )
+        } catch {
+            LiveStreamLog.client.error(
+                "createSession failed endpoint=\(endpoint.absoluteString, privacy: .public) error=\(String(describing: error), privacy: .public)"
+            )
+            throw error
+        }
     }
 
     public func uploadSegment(
@@ -112,8 +126,19 @@ public actor LiveStreamClient {
             request.setValue("true", forHTTPHeaderField: "X-Segment-Final")
         }
         request.httpBody = segment.data
-        let (data, response) = try await transport.perform(request)
-        try ensureSuccess(response, data: data)
+        do {
+            let (data, response) = try await transport.perform(request)
+            try ensureSuccess(response, data: data)
+        } catch {
+            // Per-segment failures are normal during transient network blips —
+            // the uploader handles retries. Log at debug so chronic failures
+            // accumulate in the log stream without overwhelming healthy
+            // sessions.
+            LiveStreamLog.client.debug(
+                "uploadSegment failed seq=\(segment.sequence, privacy: .public) bytes=\(segment.data.count, privacy: .public) error=\(String(describing: error), privacy: .public)"
+            )
+            throw error
+        }
     }
 
     public func endSession(_ session: LiveStreamSession) async throws {

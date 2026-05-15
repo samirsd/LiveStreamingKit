@@ -58,6 +58,7 @@ public actor LiveStreamSocialPoller {
         cancelTasks()
         resetSeen()
         self.session = session
+        LiveStreamLog.social.info("poller starting session=\(session.id, privacy: .public)")
 
         statusTask = Task { [weak self] in
             guard let self else { return }
@@ -76,6 +77,9 @@ public actor LiveStreamSocialPoller {
 
     /// Stop both loops. Safe to call multiple times.
     public func cancelPolling() {
+        if let sessionID = session?.id {
+            LiveStreamLog.social.info("poller stopping session=\(sessionID, privacy: .public)")
+        }
         cancelTasks()
         session = nil
     }
