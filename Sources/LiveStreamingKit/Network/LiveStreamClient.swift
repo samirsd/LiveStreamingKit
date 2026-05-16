@@ -238,6 +238,7 @@ public actor LiveStreamClient {
         }
         var request = URLRequest(url: url)
         request.httpMethod = method
+        request.timeoutInterval = config.requestTimeout
         if let token = await config.authTokenProvider() {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         } else {

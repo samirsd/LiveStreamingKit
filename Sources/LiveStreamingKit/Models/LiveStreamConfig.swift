@@ -31,6 +31,14 @@ public struct LiveStreamConfig: Sendable, Equatable {
     /// recorder writes. Default is `.disabled` to preserve current
     /// behavior; Carnyx overrides this to `.documents`.
     public var archivePolicy: LiveStreamArchivePolicy
+    /// Per-request HTTP timeout for control-plane calls (createSession,
+    /// endSession, listener stats, reactions, segment uploads). Defaults to
+    /// 15 s — long enough for a slow backend, short enough that a wedged
+    /// network surfaces in the UI fast instead of leaving the broadcaster
+    /// sheet stuck on "preparing stream" for `URLSession`'s 60 s default.
+    /// Segment uploads have their own retry budget on top of this
+    /// (`segmentDeliveryBudgetSeconds`).
+    public var requestTimeout: TimeInterval
 
     public init(
         ingestBaseURL: URL,
@@ -52,7 +60,8 @@ public struct LiveStreamConfig: Sendable, Equatable {
         maxBufferedSegments: Int = 15,
         segmentDeliveryBudgetSeconds: TimeInterval = 60,
         maxRetryBackoffSeconds: TimeInterval = 5,
-        archivePolicy: LiveStreamArchivePolicy = .disabled
+        archivePolicy: LiveStreamArchivePolicy = .disabled,
+        requestTimeout: TimeInterval = 15
     ) {
         self.ingestBaseURL = ingestBaseURL
         self.authTokenProvider = authTokenProvider
@@ -68,6 +77,7 @@ public struct LiveStreamConfig: Sendable, Equatable {
         self.segmentDeliveryBudgetSeconds = segmentDeliveryBudgetSeconds
         self.maxRetryBackoffSeconds = maxRetryBackoffSeconds
         self.archivePolicy = archivePolicy
+        self.requestTimeout = requestTimeout
     }
 
     public static func == (lhs: LiveStreamConfig, rhs: LiveStreamConfig) -> Bool {
@@ -84,6 +94,7 @@ public struct LiveStreamConfig: Sendable, Equatable {
             && lhs.segmentDeliveryBudgetSeconds == rhs.segmentDeliveryBudgetSeconds
             && lhs.maxRetryBackoffSeconds == rhs.maxRetryBackoffSeconds
             && lhs.archivePolicy == rhs.archivePolicy
+            && lhs.requestTimeout == rhs.requestTimeout
     }
 }
 
