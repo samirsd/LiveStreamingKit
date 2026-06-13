@@ -3,6 +3,7 @@ import Foundation
 import PackageDescription
 
 let packageDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+let isLocalPackagesWorkspace = packageDirectory.deletingLastPathComponent().lastPathComponent == "packages"
 let hasLocalAIMixKit = FileManager.default.fileExists(
     atPath: packageDirectory
         .appendingPathComponent("../AIMixKit/Package.swift")
@@ -15,7 +16,7 @@ let hasLocalLoggingKit = FileManager.default.fileExists(
 )
 let useLocalDependencies =
     ProcessInfo.processInfo.environment["USE_LOCAL_PACKAGES"] == "1" ||
-    (hasLocalAIMixKit && hasLocalLoggingKit)
+    (isLocalPackagesWorkspace && hasLocalAIMixKit && hasLocalLoggingKit)
 
 let package = Package(
     name: "LiveStreamingKit",
