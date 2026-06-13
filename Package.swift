@@ -33,10 +33,10 @@ let package = Package(
     dependencies: [
         useLocalDependencies ?
             .package(path: "../AIMixKit") :
-            .package(url: "https://github.com/samirsd/AIMixKit.git", from: "0.2.0"),
+            .package(url: "https://github.com/samirsd/AIMixKit.git", from: "1.0.11"),
         useLocalDependencies ?
             .package(path: "../LoggingKit") :
-            .package(url: "https://github.com/samirsd/LoggingKit.git", from: "1.0.0"),
+            .package(url: "https://github.com/samirsd/LoggingKit.git", from: "1.0.11"),
     ],
     targets: [
         .target(
