@@ -128,7 +128,11 @@ final class LiveStreamUploaderTests: XCTestCase {
             session: makeSession(),
             maxRetries: 1,
             maxBuffered: 4,
-            onEvent: { collector.append($0) }
+            onEvent: { collector.append($0) },
+            // Short budget + capped backoff so the drop path is exercised
+            // quickly. The legacy fixed-retry-count is ignored.
+            deliveryBudgetSeconds: 0.4,
+            maxBackoffSeconds: 0.05
         )
         await uploader.enqueue(HLSSegment(sequence: 42, data: Data([0x1]), duration: 1, isFinalSegment: false))
         await uploader.drainAndStop()
@@ -137,6 +141,40 @@ final class LiveStreamUploaderTests: XCTestCase {
             if case .segmentDropped(let seq, _) = $0, seq == 42 { return true }; return false
         }
         XCTAssertNotNil(dropped)
+    }
+
+    /// Reliability invariant: as long as the wall-clock delivery budget
+    /// is not exhausted, the uploader keeps retrying — even past the old
+    /// fixed retry ceiling of 3. This is the core of the Phase 4 change:
+    /// a transient ~10-failure outage should not lose audio.
+    func testUploaderHoldsThroughManyTransientFailuresWithinBudget() async {
+        let transport = MockTransport()
+        // Many more failures than the old maxRetries=3 would tolerate.
+        for _ in 0..<10 { await transport.queueEmpty(statusCode: 502) }
+        await transport.queueEmpty(statusCode: 204)
+
+        let client = LiveStreamClient(config: makeConfig(), transport: transport)
+        let collector = EventCollector()
+        let uploader = LiveStreamUploader(
+            client: client,
+            session: makeSession(),
+            maxRetries: 3, // legacy param — should now be ignored
+            maxBuffered: 4,
+            onEvent: { collector.append($0) },
+            deliveryBudgetSeconds: 5.0,
+            maxBackoffSeconds: 0.05
+        )
+        await uploader.enqueue(HLSSegment(sequence: 1, data: Data([0xAA]), duration: 1, isFinalSegment: false))
+        await uploader.drainAndStop()
+        let events = await collector.snapshot()
+        let uploads = events.filter {
+            if case .segmentUploaded = $0 { return true }; return false
+        }
+        XCTAssertEqual(uploads.count, 1, "segment should have eventually uploaded")
+        let drops = events.filter {
+            if case .segmentDropped = $0 { return true }; return false
+        }
+        XCTAssertTrue(drops.isEmpty, "no segment should have been dropped: \(drops)")
     }
 
     // MARK: - Helpers
