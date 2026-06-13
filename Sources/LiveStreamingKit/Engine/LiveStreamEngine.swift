@@ -1,6 +1,7 @@
 import Foundation
 @preconcurrency import AVFoundation
 import AIMixKit
+import LoggingKit
 import os
 
 public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
@@ -92,6 +93,16 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
         LiveStreamLog.engine.info(
             "start requested host=\(self.config.ingestBaseURL.host ?? "?", privacy: .public) sampleRate=\(self.config.sampleRate, privacy: .public) bitrate=\(self.config.stereoBitrate, privacy: .public) segmentDuration=\(self.config.segmentDuration, privacy: .public) aiMix=\(String(describing: self.config.aiMixMode), privacy: .public)"
         )
+        VisibilityDiagnostics.trackFeatureAction(
+            surface: .liveStreaming,
+            feature: "broadcast",
+            action: "start",
+            phase: .started,
+            properties: [
+                "sample_rate": "\(Int(config.sampleRate))",
+                "duration_seconds": "\(config.segmentDuration)"
+            ]
+        )
         try transition { current in
             switch current {
             case .idle, .stopped, .failed:
@@ -144,11 +155,36 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
                 await socialPoller.start(newSession)
             }
             startHealthMonitor()
+            VisibilityDiagnostics.trackFeatureAction(
+                surface: .liveStreaming,
+                feature: "broadcast",
+                action: "start",
+                phase: .completed,
+                properties: [
+                    "sample_rate": "\(Int(config.sampleRate))",
+                    "duration_seconds": "\(config.segmentDuration)"
+                ]
+            )
             return newSession
         } catch {
             let mapped = mapStartError(error)
             LiveStreamLog.engine.error(
                 "start failed category=\(mapped.telemetryCategory, privacy: .public) reason=\(String(describing: mapped), privacy: .public) raw=\(String(describing: error), privacy: .public)"
+            )
+            VisibilityDiagnostics.trackFeatureAction(
+                surface: .liveStreaming,
+                feature: "broadcast",
+                action: "start",
+                phase: .failed,
+                properties: [
+                    "error_message": mapped.telemetryCategory,
+                    "error_domain": "LiveStreamError"
+                ]
+            )
+            VisibilityDiagnostics.captureError(
+                mapped,
+                context: "livestream_start",
+                properties: ["error_category": mapped.telemetryCategory]
             )
             try? transition { _ in .failed(mapped) }
             throw mapped
@@ -168,6 +204,13 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
             return
         }
         LiveStreamLog.engine.info("stop requested reason=\(String(describing: reason), privacy: .public)")
+        VisibilityDiagnostics.trackFeatureAction(
+            surface: .liveStreaming,
+            feature: "broadcast",
+            action: "stop",
+            phase: .started,
+            properties: ["source": "\(reason)"]
+        )
 
         // Stop the social poller first so the broadcaster's view stops
         // accumulating counts while the encoder flushes its tail.
@@ -185,7 +228,12 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
                 return current
             }
         }
+        var deliveredSegmentCount = snapshot.3
         if let segmenter = snapshot.2, let finalSegment = segmenter.finish() {
+            deliveredSegmentCount = state.withLock { pipeline in
+                pipeline.segmentsEncoded += 1
+                return pipeline.segmentsEncoded
+            }
             LiveStreamLog.engine.debug("enqueueing final segment seq=\(finalSegment.sequence, privacy: .public)")
             // Mirror to the archive so it captures the tail of the stream
             // before the file handle closes.
@@ -198,10 +246,16 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
         if let activeSession = snapshot.1 {
             do {
                 try await client.endSession(activeSession)
-                LiveStreamLog.engine.info("session ended cleanly id=\(activeSession.id, privacy: .public) segments=\(snapshot.3, privacy: .public)")
+                LiveStreamLog.engine.info("session ended cleanly id=\(activeSession.id, privacy: .public) segments=\(deliveredSegmentCount, privacy: .public)")
             } catch {
                 // We're shutting down — log but don't fail the stop path.
                 LiveStreamLog.engine.error("endSession failed id=\(activeSession.id, privacy: .public) error=\(String(describing: error), privacy: .public)")
+                VisibilityDiagnostics.recordBreadcrumb(
+                    category: "LiveStreaming",
+                    message: "end_session_failed",
+                    level: .warning,
+                    properties: ["error_message": String(describing: error)]
+                )
             }
         }
         // Finalize the local archive last, after the uploader has drained
@@ -211,6 +265,13 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
             let (url, bytes) = await archive.finalize()
             if bytes > 0 {
                 onEvent(.archiveSaved(url: url, byteCount: bytes))
+                VisibilityDiagnostics.trackFeatureAction(
+                    surface: .liveStreaming,
+                    feature: "broadcast_archive",
+                    action: "save",
+                    phase: .completed,
+                    properties: ["file_size_bytes": "\(bytes)"]
+                )
             } else {
                 LiveStreamLog.engine.warning(
                     "archive finalized empty — no segments were captured path=\(url.path, privacy: .public)"
@@ -218,6 +279,16 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
             }
         }
         try? transition { _ in .stopped(reason: reason) }
+        VisibilityDiagnostics.trackFeatureAction(
+            surface: .liveStreaming,
+            feature: "broadcast",
+            action: "stop",
+            phase: .completed,
+            properties: [
+                "source": "\(reason)",
+                "item_count": "\(deliveredSegmentCount)"
+            ]
+        )
     }
 
     // MARK: - Audio interruption handling
@@ -583,6 +654,25 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
         LiveStreamLog.engine.info(
             "health \(String(describing: priorHealth), privacy: .public) → \(String(describing: newHealth), privacy: .public) reason=\(reason, privacy: .public)"
         )
+        VisibilityDiagnostics.recordBreadcrumb(
+            category: "LiveStreaming",
+            message: "stream_health_changed",
+            level: newHealth == .healthy ? .info : .warning,
+            properties: [
+                "source": "\(priorHealth)",
+                "action_status": "\(newHealth)",
+                "error_message": reason
+            ]
+        )
+        if newHealth == .failing {
+            VisibilityDiagnostics.trackFeatureAction(
+                surface: .liveStreaming,
+                feature: "broadcast",
+                action: "health_check",
+                phase: .failed,
+                properties: ["error_message": reason]
+            )
+        }
         onEvent(.streamHealthChanged(newHealth, reason: reason))
     }
 

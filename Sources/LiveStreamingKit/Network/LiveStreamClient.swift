@@ -1,4 +1,5 @@
 import Foundation
+import LoggingKit
 
 public struct CreateSessionRequest: Codable, Sendable {
     public let multitrack_recording_id: String?
@@ -181,8 +182,22 @@ public actor LiveStreamClient {
         _ session: LiveStreamSession,
         type: String
     ) async -> LiveReactionEvent? {
+        VisibilityDiagnostics.trackFeatureAction(
+            surface: .liveStreaming,
+            feature: "listener_reaction",
+            action: "send",
+            phase: .started,
+            properties: ["source": type]
+        )
         let path = "/api/v1/livestream/sessions/\(session.id)/reactions/"
         guard let url = URL(string: path, relativeTo: config.ingestBaseURL)?.absoluteURL else {
+            VisibilityDiagnostics.trackFeatureAction(
+                surface: .liveStreaming,
+                feature: "listener_reaction",
+                action: "send",
+                phase: .failed,
+                properties: ["error_message": "invalid_reaction_url"]
+            )
             return nil
         }
         var request = URLRequest(url: url)
@@ -192,10 +207,36 @@ public actor LiveStreamClient {
         request.httpBody = try? JSONEncoder().encode(["type": type])
         do {
             let (data, response) = try await transport.perform(request)
-            guard (200..<300).contains(response.statusCode) else { return nil }
+            guard (200..<300).contains(response.statusCode) else {
+                VisibilityDiagnostics.trackFeatureAction(
+                    surface: .liveStreaming,
+                    feature: "listener_reaction",
+                    action: "send",
+                    phase: .failed,
+                    properties: [
+                        "upload_ack_status": "\(response.statusCode)",
+                        "error_message": "http_status"
+                    ]
+                )
+                return nil
+            }
             let dto = try JSONDecoder().decode(ReactionDTO.self, from: data)
+            VisibilityDiagnostics.trackFeatureAction(
+                surface: .liveStreaming,
+                feature: "listener_reaction",
+                action: "send",
+                phase: .completed,
+                properties: ["source": type]
+            )
             return LiveReactionEvent(id: dto.id, type: dto.type, ts: dto.ts)
         } catch {
+            VisibilityDiagnostics.trackFeatureAction(
+                surface: .liveStreaming,
+                feature: "listener_reaction",
+                action: "send",
+                phase: .failed,
+                properties: ["error_message": String(describing: error)]
+            )
             return nil
         }
     }

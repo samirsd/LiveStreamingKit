@@ -8,9 +8,14 @@ let hasLocalAIMixKit = FileManager.default.fileExists(
         .appendingPathComponent("../AIMixKit/Package.swift")
         .standardizedFileURL.path
 )
+let hasLocalLoggingKit = FileManager.default.fileExists(
+    atPath: packageDirectory
+        .appendingPathComponent("../LoggingKit/Package.swift")
+        .standardizedFileURL.path
+)
 let useLocalDependencies =
     ProcessInfo.processInfo.environment["USE_LOCAL_PACKAGES"] == "1" ||
-    hasLocalAIMixKit
+    (hasLocalAIMixKit && hasLocalLoggingKit)
 
 let package = Package(
     name: "LiveStreamingKit",
@@ -28,11 +33,14 @@ let package = Package(
         useLocalDependencies ?
             .package(path: "../AIMixKit") :
             .package(url: "https://github.com/samirsd/AIMixKit.git", from: "0.2.0"),
+        useLocalDependencies ?
+            .package(path: "../LoggingKit") :
+            .package(url: "https://github.com/samirsd/LoggingKit.git", from: "1.0.0"),
     ],
     targets: [
         .target(
             name: "LiveStreamingKit",
-            dependencies: ["AIMixKit"]
+            dependencies: ["AIMixKit", "LoggingKit"]
         ),
         .testTarget(
             name: "LiveStreamingKitTests",

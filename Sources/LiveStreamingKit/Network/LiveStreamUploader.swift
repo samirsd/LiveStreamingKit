@@ -1,4 +1,5 @@
 import Foundation
+import LoggingKit
 import Network
 
 /// Per-segment HLS upload pump.
@@ -75,6 +76,17 @@ public actor LiveStreamUploader {
             LiveStreamLog.uploader.warning(
                 "queue full — dropping oldest seq=\(dropped.segment.sequence, privacy: .public) queueDepth=\(self.queue.count, privacy: .public) droppedTotal=\(self.droppedTotal, privacy: .public)"
             )
+            VisibilityDiagnostics.trackFeatureAction(
+                surface: .liveStreaming,
+                feature: "segment_upload",
+                action: "drop",
+                phase: .failed,
+                properties: [
+                    "item_count": "\(queue.count)",
+                    "count": "\(droppedTotal)",
+                    "error_message": "buffer_full"
+                ]
+            )
             onEvent(.segmentDropped(sequence: dropped.segment.sequence, reason: "buffer full"))
         }
         queue.append(QueuedSegment(segment: segment, enqueuedAt: Date()))
@@ -144,6 +156,15 @@ public actor LiveStreamUploader {
                 LiveStreamLog.uploader.debug(
                     "retrying seq=\(queued.segment.sequence, privacy: .public) attempt=\(attempt, privacy: .public) backoffMs=\(backoffMillis, privacy: .public)"
                 )
+                VisibilityDiagnostics.recordBreadcrumb(
+                    category: "LiveStreaming",
+                    message: "segment_upload_retry",
+                    level: .warning,
+                    properties: [
+                        "item_count": "\(attempt)",
+                        "duration_seconds": "\(Double(backoffMillis) / 1000.0)"
+                    ]
+                )
                 onEvent(.segmentRetrying(sequence: queued.segment.sequence, attempt: attempt))
                 try? await Task.sleep(nanoseconds: UInt64(backoffMillis) * 1_000_000)
             }
@@ -151,6 +172,17 @@ public actor LiveStreamUploader {
         let totalElapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
         LiveStreamLog.uploader.error(
             "delivery budget exhausted seq=\(queued.segment.sequence, privacy: .public) attempts=\(attempt, privacy: .public) elapsedMs=\(totalElapsedMs, privacy: .public)"
+        )
+        VisibilityDiagnostics.trackFeatureAction(
+            surface: .liveStreaming,
+            feature: "segment_upload",
+            action: "deliver",
+            phase: .failed,
+            properties: [
+                "item_count": "\(attempt)",
+                "duration_seconds": "\(Double(totalElapsedMs) / 1000.0)",
+                "error_message": "delivery_budget_exhausted"
+            ]
         )
         onEvent(.segmentDropped(
             sequence: queued.segment.sequence,
@@ -171,6 +203,12 @@ public actor LiveStreamUploader {
         }
         if pathIsSatisfied {
             LiveStreamLog.uploader.info("network path recovered — resuming uploads")
+            VisibilityDiagnostics.recordBreadcrumb(
+                category: "LiveStreaming",
+                message: "network_path_recovered",
+                level: .info,
+                properties: ["item_count": "\(queue.count)"]
+            )
         }
     }
 
@@ -202,6 +240,15 @@ public actor LiveStreamUploader {
         pathIsSatisfied = satisfied
         LiveStreamLog.uploader.info(
             "reachability changed satisfied=\(satisfied, privacy: .public) queueDepth=\(self.queue.count, privacy: .public)"
+        )
+        VisibilityDiagnostics.recordBreadcrumb(
+            category: "LiveStreaming",
+            message: "network_path_changed",
+            level: satisfied ? .info : .warning,
+            properties: [
+                "action_status": satisfied ? "satisfied" : "unsatisfied",
+                "item_count": "\(queue.count)"
+            ]
         )
     }
 }
