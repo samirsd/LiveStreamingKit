@@ -34,6 +34,8 @@ public enum LiveStreamEvent: Sendable, Equatable {
     case segmentUploaded(sequence: Int, bytes: Int, durationMs: Int)
     case segmentRetrying(sequence: Int, attempt: Int)
     case segmentDropped(sequence: Int, reason: String)
+    /// Server-side status, independent of the broadcaster engine lifecycle.
+    case sessionStatusChanged(String)
     case listenerCountChanged(Int)
     case lifetimeListenerStatsChanged(total: Int, peak: Int)
     case reactionTotalsChanged([String: Int])

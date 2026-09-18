@@ -31,6 +31,8 @@ public actor LiveStreamSocialPoller {
     private var statusTask: Task<Void, Never>?
     private var reactionsTask: Task<Void, Never>?
 
+    private var generation: UInt64 = 0
+    private var lastSessionStatus: String?
     private var lastReactionTs: TimeInterval?
     private var seenReactionIDs: Set<String> = []
     private var lastListenerCount: Int = -1
@@ -58,15 +60,16 @@ public actor LiveStreamSocialPoller {
         cancelTasks()
         resetSeen()
         self.session = session
+        let generation = self.generation
         LiveStreamLog.social.info("poller starting session=\(session.id, privacy: .public)")
 
         statusTask = Task { [weak self] in
             guard let self else { return }
-            await self.runStatusLoop()
+            await self.runStatusLoop(generation: generation)
         }
         reactionsTask = Task { [weak self] in
             guard let self else { return }
-            await self.runReactionsLoop()
+            await self.runReactionsLoop(generation: generation)
         }
     }
 
@@ -86,20 +89,20 @@ public actor LiveStreamSocialPoller {
 
     // MARK: - Loops
 
-    private func runStatusLoop() async {
-        while !Task.isCancelled, let session = self.session {
-            if let status = await client.fetchSessionStatus(session) {
-                processStatus(status)
-            }
+    private func runStatusLoop(generation: UInt64) async {
+        while !Task.isCancelled, generation == self.generation, let session = self.session {
+            let status = await client.fetchSessionStatus(session)
+            guard !Task.isCancelled, generation == self.generation else { return }
+            if let status { processStatus(status) }
             try? await Task.sleep(nanoseconds: UInt64(statusInterval * 1_000_000_000))
         }
     }
 
-    private func runReactionsLoop() async {
-        while !Task.isCancelled, let session = self.session {
-            if let response = await client.fetchReactions(session, since: lastReactionTs) {
-                processReactions(response.reactions)
-            }
+    private func runReactionsLoop(generation: UInt64) async {
+        while !Task.isCancelled, generation == self.generation, let session = self.session {
+            let response = await client.fetchReactions(session, since: lastReactionTs)
+            guard !Task.isCancelled, generation == self.generation else { return }
+            if let response { processReactions(response.reactions) }
             try? await Task.sleep(nanoseconds: UInt64(reactionsInterval * 1_000_000_000))
         }
     }
@@ -107,6 +110,10 @@ public actor LiveStreamSocialPoller {
     // MARK: - Processing
 
     private func processStatus(_ status: SessionStatusResponse) {
+        if status.status != lastSessionStatus {
+            lastSessionStatus = status.status
+            onEvent(.sessionStatusChanged(status.status))
+        }
         if let current = status.listener_count, current != lastListenerCount {
             lastListenerCount = current
             onEvent(.listenerCountChanged(current))
@@ -145,6 +152,7 @@ public actor LiveStreamSocialPoller {
     }
 
     private func cancelTasks() {
+        generation &+= 1
         statusTask?.cancel()
         statusTask = nil
         reactionsTask?.cancel()
@@ -152,6 +160,7 @@ public actor LiveStreamSocialPoller {
     }
 
     private func resetSeen() {
+        lastSessionStatus = nil
         lastReactionTs = nil
         seenReactionIDs.removeAll(keepingCapacity: true)
         lastListenerCount = -1

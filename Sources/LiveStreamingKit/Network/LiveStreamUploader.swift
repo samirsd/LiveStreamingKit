@@ -99,6 +99,16 @@ public actor LiveStreamUploader {
         pathMonitor.cancel()
     }
 
+    /// The backend has already closed this session: further uploads cannot
+    /// succeed, so cancel pending delivery instead of spending the retry budget.
+    public func cancelAndStop() async {
+        stopped = true
+        queue.removeAll()
+        inflight?.cancel()
+        await inflight?.value
+        pathMonitor.cancel()
+    }
+
     private func startProcessingIfNeeded() {
         if inflight != nil { return }
         inflight = Task { [weak self] in
@@ -107,12 +117,10 @@ public actor LiveStreamUploader {
     }
 
     private func processLoop() async {
-        while true {
+        defer { inflight = nil }
+        while !Task.isCancelled {
             let next: QueuedSegment? = await dequeue()
-            guard let queued = next else {
-                inflight = nil
-                return
-            }
+            guard let queued = next else { return }
             await uploadWithRetry(queued)
         }
     }
@@ -126,12 +134,13 @@ public actor LiveStreamUploader {
         var attempt = 0
         let startedAt = Date()
         let deadline = queued.enqueuedAt.addingTimeInterval(deliveryBudget)
-        while Date() < deadline {
+        while !Task.isCancelled && Date() < deadline {
             // If the device thinks there's no network at all, don't burn
             // retries — wait for the path to come back. We bound the wait
             // by the segment's deadline so a permanent-offline broadcast
             // still surfaces the drop event eventually.
             await waitForPathOrDeadline(deadline: deadline)
+            if Task.isCancelled { return }
             if Date() >= deadline { break }
 
             do {
@@ -169,6 +178,7 @@ public actor LiveStreamUploader {
                 try? await Task.sleep(nanoseconds: UInt64(backoffMillis) * 1_000_000)
             }
         }
+        guard !Task.isCancelled else { return }
         let totalElapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
         LiveStreamLog.uploader.error(
             "delivery budget exhausted seq=\(queued.segment.sequence, privacy: .public) attempts=\(attempt, privacy: .public) elapsedMs=\(totalElapsedMs, privacy: .public)"
@@ -198,7 +208,7 @@ public actor LiveStreamUploader {
         LiveStreamLog.uploader.debug(
             "network unsatisfied — pausing uploads until path recovers (deadline=\(self.deadlineSeconds(deadline), privacy: .public)s)"
         )
-        while !pathIsSatisfied && Date() < deadline {
+        while !Task.isCancelled && !pathIsSatisfied && Date() < deadline {
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
         if pathIsSatisfied {

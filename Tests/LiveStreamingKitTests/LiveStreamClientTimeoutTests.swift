@@ -31,6 +31,24 @@ final class LiveStreamClientTimeoutTests: XCTestCase {
                        "createSession URLRequest must inherit LiveStreamConfig.requestTimeout")
     }
 
+    func testListenerStatusRequestAppliesConfiguredTimeout() async {
+        let transport = MockTransport()
+        await transport.queueJSON(SessionStatusResponse(status: "live", listener_count: 0,
+            total_listeners: 0, peak_listener_count: 0, reaction_totals: [:]), statusCode: 200)
+        let client = LiveStreamClient(config: LiveStreamConfig(
+            ingestBaseURL: URL(string: "https://example.com")!,
+            authTokenProvider: { nil }, requestTimeout: 7
+        ), transport: transport)
+        let session = LiveStreamSession(id: "listener", ingestToken: "",
+            ingestURL: URL(string: "https://example.com")!,
+            listenerURL: URL(string: "https://example.com")!,
+            masterPlaylistURL: URL(string: "https://example.com")!)
+        _ = await client.fetchSessionStatus(session)
+        let captured = await transport.captured
+        XCTAssertEqual(captured.first?.timeoutInterval ?? 0, 7, accuracy: 0.001)
+        XCTAssertNil(captured.first?.value(forHTTPHeaderField: "Authorization"))
+    }
+
     func testDefaultTimeoutIsSensibleForInteractiveUI() {
         let config = LiveStreamConfig(
             ingestBaseURL: URL(string: "https://example.com")!,

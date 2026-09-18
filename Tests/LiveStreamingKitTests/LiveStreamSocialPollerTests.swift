@@ -117,6 +117,30 @@ final class LiveStreamSocialPollerTests: XCTestCase {
         XCTAssertEqual(ids.count, 3, "each reaction id should be emitted exactly once")
     }
 
+    func testEmitsSessionStatusTransitions() async {
+        let transport = ScriptedTransport()
+        await transport.queueStatus(status: "pending")
+        await transport.queueStatus(status: "live")
+        await transport.queueStatus(status: "ended")
+        let pending = expectation(description: "pending")
+        let live = expectation(description: "live")
+        let ended = expectation(description: "ended")
+        let poller = LiveStreamSocialPoller(client: makeClient(transport: transport),
+            statusInterval: 0.01, reactionsInterval: 1) { event in
+            if case .sessionStatusChanged(let status) = event {
+                switch status {
+                case "pending": pending.fulfill()
+                case "live": live.fulfill()
+                case "ended": ended.fulfill()
+                default: break
+                }
+            }
+        }
+        await poller.start(makeSession())
+        await fulfillment(of: [pending, live, ended], timeout: 2, enforceOrder: true)
+        await poller.stop()
+    }
+
     // MARK: - Helpers
 
     private func makeClient(transport: HTTPTransport) -> LiveStreamClient {
@@ -158,13 +182,14 @@ private actor ScriptedTransport: HTTPTransport {
     private var reactionResponses: [Data] = []
 
     func queueStatus(
+        status: String = "live",
         listenerCount: Int? = nil,
         totalListeners: Int? = nil,
         peakListenerCount: Int? = nil,
         reactionTotals: [String: Int]? = nil
     ) {
         let payload = SessionStatusResponse(
-            status: "live",
+            status: status,
             listener_count: listenerCount,
             total_listeners: totalListeners,
             peak_listener_count: peakListenerCount,

@@ -9,6 +9,9 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
 
     private struct PipelineState: @unchecked Sendable {
         var liveState: LiveStreamState = .idle
+        var generation: UUID?
+        var socialPoller: LiveStreamSocialPoller?
+        var deliveryTask: Task<Void, Never>?
         var session: LiveStreamSession?
         var uploader: LiveStreamUploader?
         var archive: LiveStreamArchive?
@@ -44,7 +47,8 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
     private let config: LiveStreamConfig
     private let client: LiveStreamClient
     private let externalEventHandler: EventHandler
-    private let socialPoller: LiveStreamSocialPoller
+    // Serialize state changes and their synchronous event emissions. Never held across await.
+    private let lifecycleLock = NSRecursiveLock()
     private let state = OSAllocatedUnfairLock(initialState: PipelineState())
     private let processingQueue = DispatchQueue(label: "carnyx.livestream.engine", qos: .userInitiated)
     private var healthMonitorTask: Task<Void, Never>?
@@ -82,11 +86,6 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
         let client = LiveStreamClient(config: config, transport: transport)
         self.client = client
         self.externalEventHandler = onEvent
-        // The poller forwards engagement events through the same external
-        // handler — but bypasses the internal `onEvent(_:)` wrapper because
-        // engagement signals don't update health bookkeeping. The poller is
-        // dormant until `start()` hands it a session.
-        self.socialPoller = LiveStreamSocialPoller(client: client, onEvent: onEvent)
     }
 
     public func start() async throws -> LiveStreamSession {
@@ -103,12 +102,18 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
                 "duration_seconds": "\(config.segmentDuration)"
             ]
         )
-        try transition { current in
-            switch current {
-            case .idle, .stopped, .failed:
-                return .preparing
-            case .preparing, .live, .stopping:
-                throw LiveStreamError.sessionAlreadyStarted
+        let generation = UUID()
+        try withLifecycleLock {
+            try transition { current in
+                switch current {
+                case .idle, .stopped, .failed:
+                    return .preparing
+                case .preparing, .live, .stopping:
+                    throw LiveStreamError.sessionAlreadyStarted
+                }
+            }
+            state.withLock { pipeline in
+                pipeline = PipelineState(liveState: .preparing, generation: generation)
             }
         }
         do {
@@ -116,12 +121,16 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
             LiveStreamLog.engine.info(
                 "session created id=\(newSession.id, privacy: .public) ingest=\(newSession.ingestURL.absoluteString, privacy: .public)"
             )
+            guard !Task.isCancelled, isPreparing(generation) else {
+                await endOrphanSession(newSession)
+                throw CancellationError()
+            }
             let uploader = LiveStreamUploader(
                 client: client,
                 session: newSession,
                 maxRetries: config.maxSegmentRetries,
                 maxBuffered: config.maxBufferedSegments,
-                onEvent: onEvent,
+                onEvent: { [weak self] event in self?.onEvent(event, generation: generation) },
                 deliveryBudgetSeconds: config.segmentDeliveryBudgetSeconds,
                 maxBackoffSeconds: config.maxRetryBackoffSeconds
             )
@@ -140,21 +149,29 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
                 }
                 return opened
             }()
-            state.withLock { pipeline in
-                pipeline.session = newSession
-                pipeline.uploader = uploader
-                pipeline.archive = archive
-                pipeline.hasReceivedFirstBuffer = false
-                pipeline.segmentsEncoded = 0
+            let poller = LiveStreamSocialPoller(client: client) { [weak self] event in
+                self?.onEvent(event, generation: generation)
             }
-            try transition { _ in .live(session: newSession, since: Date()) }
-            // Start polling for listener / reaction stats. The poller is an
-            // actor so this is fire-and-forget — failures degrade silently
-            // and never affect the audio pipeline.
-            Task { [socialPoller] in
-                await socialPoller.start(newSession)
+            await poller.start(newSession)
+            let accepted = withLifecycleLock { () -> Bool in
+                guard !Task.isCancelled, isPreparing(generation) else { return false }
+                state.withLock { pipeline in
+                    pipeline.session = newSession
+                    pipeline.uploader = uploader
+                    pipeline.archive = archive
+                    pipeline.socialPoller = poller
+                }
+                try? transition { _ in .live(session: newSession, since: Date()) }
+                startHealthMonitor()
+                return true
             }
-            startHealthMonitor()
+            guard accepted else {
+                await poller.stop()
+                await uploader.drainAndStop()
+                if let archive { await archive.finalize() }
+                await endOrphanSession(newSession)
+                throw CancellationError()
+            }
             VisibilityDiagnostics.trackFeatureAction(
                 surface: .liveStreaming,
                 feature: "broadcast",
@@ -167,6 +184,14 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
             )
             return newSession
         } catch {
+            if error is CancellationError || Task.isCancelled || !isPreparing(generation) {
+                withLifecycleLock {
+                    guard isPreparing(generation) else { return }
+                    state.withLock { $0.generation = nil }
+                    try? transition { _ in .stopped(reason: .requested) }
+                }
+                throw CancellationError()
+            }
             let mapped = mapStartError(error)
             LiveStreamLog.engine.error(
                 "start failed category=\(mapped.telemetryCategory, privacy: .public) reason=\(String(describing: mapped), privacy: .public) raw=\(String(describing: error), privacy: .public)"
@@ -186,23 +211,40 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
                 context: "livestream_start",
                 properties: ["error_category": mapped.telemetryCategory]
             )
-            try? transition { _ in .failed(mapped) }
+            withLifecycleLock {
+                guard isPreparing(generation) else { return }
+                state.withLock { $0.generation = nil }
+                try? transition { _ in .failed(mapped) }
+            }
             throw mapped
         }
     }
 
     public func stop(reason: LiveStreamState.StopReason = .requested) async {
-        // No-op from terminal/initial states — only `.live` / `.preparing` can be stopped.
-        let shouldProceed = state.withLock { pipeline -> Bool in
-            switch pipeline.liveState {
-            case .live, .preparing: return true
-            default: return false
+        guard claimStop() else { return }
+        await finishStop(reason: reason)
+    }
+
+    private func claimStop() -> Bool {
+        // Claim the stop before the first suspension. A pending create may
+        // still return, but its generation can no longer publish a live session.
+        withLifecycleLock {
+            let canStop = state.withLock { pipeline -> Bool in
+                switch pipeline.liveState {
+                case .live, .preparing:
+                    pipeline.generation = nil
+                    return true
+                default: return false
+                }
             }
+            guard canStop else { return false }
+            try? transition { _ in .stopping }
+            stopHealthMonitor()
+            return true
         }
-        guard shouldProceed else {
-            LiveStreamLog.engine.debug("stop ignored — not in live/preparing state")
-            return
-        }
+    }
+
+    private func finishStop(reason: LiveStreamState.StopReason, failure: LiveStreamError? = nil) async {
         LiveStreamLog.engine.info("stop requested reason=\(String(describing: reason), privacy: .public)")
         VisibilityDiagnostics.trackFeatureAction(
             surface: .liveStreaming,
@@ -212,22 +254,17 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
             properties: ["source": "\(reason)"]
         )
 
-        // Stop the social poller first so the broadcaster's view stops
-        // accumulating counts while the encoder flushes its tail.
-        await socialPoller.stop()
-        stopHealthMonitor()
+        let poller = state.withLock { $0.socialPoller }
+        await poller?.stop()
 
-        let snapshot: (LiveStreamUploader?, LiveStreamSession?, HLSSegmenter?, Int, LiveStreamArchive?) = state.withLock { pipeline in
-            (pipeline.uploader, pipeline.session, pipeline.segmenter, pipeline.segmentsEncoded, pipeline.archive)
+        // Finish only after any buffer already encoding on the serial queue.
+        // The stopping state prevents queued/new buffers from entering the pipeline.
+        await flushProcessingQueue()
+        let snapshot = state.withLock { pipeline in
+            (pipeline.uploader, pipeline.session, pipeline.segmenter,
+             pipeline.segmentsEncoded, pipeline.archive, pipeline.deliveryTask)
         }
-        try? transition { current in
-            switch current {
-            case .live, .preparing:
-                return .stopping
-            default:
-                return current
-            }
-        }
+        await snapshot.5?.value
         var deliveredSegmentCount = snapshot.3
         if let segmenter = snapshot.2, let finalSegment = segmenter.finish() {
             deliveredSegmentCount = state.withLock { pipeline in
@@ -240,9 +277,13 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
             if let archive = snapshot.4 {
                 await archive.append(finalSegment.data)
             }
-            await snapshot.0?.enqueue(finalSegment)
+            if reason != .backendClosed { await snapshot.0?.enqueue(finalSegment) }
         }
-        await snapshot.0?.drainAndStop()
+        if reason == .backendClosed {
+            await snapshot.0?.cancelAndStop()
+        } else {
+            await snapshot.0?.drainAndStop()
+        }
         if let activeSession = snapshot.1 {
             do {
                 try await client.endSession(activeSession)
@@ -278,7 +319,12 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
                 )
             }
         }
-        try? transition { _ in .stopped(reason: reason) }
+        withLifecycleLock {
+            state.withLock { pipeline in
+                pipeline = PipelineState(liveState: .stopping)
+            }
+            try? transition { _ in failure.map(LiveStreamState.failed) ?? .stopped(reason: reason) }
+        }
         VisibilityDiagnostics.trackFeatureAction(
             surface: .liveStreaming,
             feature: "broadcast",
@@ -306,6 +352,7 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
     /// platform-agnostic.
     public func handleAudioInterruptionBegan() {
         let wasInterrupted = state.withLock { pipeline -> Bool in
+            guard case .live = pipeline.liveState else { return true }
             let prior = pipeline.isInterrupted
             pipeline.isInterrupted = true
             if !prior { pipeline.interruptionStartedAt = Date() }
@@ -335,7 +382,8 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
                 pipeline.downmixer = nil
                 pipeline.aiMixProcessor = nil
                 pipeline.encoder = nil
-                pipeline.segmenter = nil
+                // Keep the segmenter: sequence numbers belong to the session,
+                // not to the upstream audio route or encoder instance.
             }
             return duration
         }
@@ -367,7 +415,7 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
         guard let buffer else { return }
         let currentState = liveState
         switch currentState {
-        case .live, .preparing:
+        case .live:
             break
         default:
             return
@@ -440,17 +488,27 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
                     // ADTS frames, so concatenating them yields a playable
                     // AAC file. Archive writes are best-effort — never fail
                     // the live path on a disk error.
-                    if let archive {
-                        let payload = segment.data
-                        Task { await archive.append(payload) }
+                    state.withLock { pipeline in
+                        let previous = pipeline.deliveryTask
+                        pipeline.deliveryTask = Task {
+                            await previous?.value
+                            if let archive { await archive.append(segment.data) }
+                            await uploader.enqueue(segment)
+                        }
                     }
-                    Task { await uploader.enqueue(segment) }
                 }
             }
         } catch {
             LiveStreamLog.engine.error("encode failed error=\(String(describing: error), privacy: .public)")
-            onEvent(.stateChanged(.failed(.encoderFailed(String(describing: error)))))
+            handleEncodingFailure(.encoderFailed(String(describing: error)))
         }
+    }
+
+    // Move the actual engine into shutdown, rather than only telling the UI
+    // it failed while encoding and uploading keep running behind the error.
+    func handleEncodingFailure(_ error: LiveStreamError) {
+        guard claimStop() else { return }
+        Task { await self.finishStop(reason: .requested, failure: error) }
     }
 
     private func ensurePipelineReady(for buffer: AVAudioPCMBuffer) {
@@ -500,7 +558,9 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
             pipeline.downmixer = downmixer
             pipeline.aiMixProcessor = aiMixProcessor
             pipeline.encoder = encoder
-            pipeline.segmenter = segmenter
+            // Input formats can change mid-session; keep the existing HLS
+            // sequence and pending encoded audio across an encoder rebuild.
+            if pipeline.segmenter == nil { pipeline.segmenter = segmenter }
         }
         LiveStreamLog.engine.info(
             "pipeline ready inputRate=\(inputSampleRate, privacy: .public) inputChannels=\(inputChannelCount, privacy: .public) outputRate=\(self.config.sampleRate, privacy: .public) bitrate=\(self.config.stereoBitrate, privacy: .public) segmentDuration=\(self.config.segmentDuration, privacy: .public) aiMix=\(self.config.aiMixMode == .off ? "off" : "broadcastPolish", privacy: .public)"
@@ -528,6 +588,42 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
             memcpy(dst[channel], src[channel], bytes)
         }
         return copy
+    }
+
+    private func withLifecycleLock<T>(_ operation: () throws -> T) rethrows -> T {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return try operation()
+    }
+
+    private func endOrphanSession(_ session: LiveStreamSession) async {
+        // A cancelled start must still notify the backend. An unstructured task
+        // gives cleanup its own cancellation lifetime and the client's timeout.
+        await Task { [client] in try? await client.endSession(session) }.value
+    }
+
+    private func isPreparing(_ generation: UUID) -> Bool {
+        state.withLock { $0.generation == generation && $0.liveState == .preparing }
+    }
+
+    private func onEvent(_ event: LiveStreamEvent, generation: UUID) {
+        withLifecycleLock {
+            guard state.withLock({ $0.generation == generation }) else { return }
+            onEvent(event)
+            if case .sessionStatusChanged(let status) = event,
+               ["ended", "failed"].contains(status.lowercased()), claimStop() {
+                // Backend idle expiry or an operator stop is authoritative.
+                // Stop ingesting rather than endlessly retrying terminal 409s.
+                Task { await self.finishStop(reason: .backendClosed) }
+            }
+        }
+    }
+
+    // Internal so tests can await processing without timing-dependent sleeps.
+    func flushProcessingQueue() async {
+        await withCheckedContinuation { continuation in
+            processingQueue.async { continuation.resume() }
+        }
     }
 
     private func transition(_ mutate: @Sendable (LiveStreamState) throws -> LiveStreamState) throws {
@@ -592,7 +688,8 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
             // Sleep 5s between checks. Faster polling buys nothing — the
             // segment cadence is already 4s minimum.
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                do { try await Task.sleep(nanoseconds: 5_000_000_000) }
+                catch { return }
                 guard let self else { return }
                 self.evaluateHealth()
             }
@@ -611,27 +708,26 @@ public final class LiveStreamEngine: AudioBufferObserver, @unchecked Sendable {
         }
     }
 
-    private func evaluateHealth() {
-        let now = Date()
+    func evaluateHealth(at now: Date = Date()) {
+        withLifecycleLock { evaluateHealthSnapshot(at: now) }
+    }
+
+    private func evaluateHealthSnapshot(at now: Date) {
         let snapshot: (LiveStreamHealth, Date?, Date?, Bool, LiveStreamState) = state.withLock { pipeline in
             (pipeline.lastHealth, pipeline.lastEncodeAt, pipeline.lastUploadAt, pipeline.isInterrupted, pipeline.liveState)
         }
         // Only evaluate while we're actually live. Preparing has no audio
         // expectation yet; stopping is mid-flush.
-        guard case .live = snapshot.4 else { return }
+        guard case .live(_, let since) = snapshot.4 else { return }
         // Interruptions are an expected pause — don't penalize for them.
         if snapshot.3 { return }
 
         let priorHealth = snapshot.0
-        let encodeAgo = snapshot.1.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
-        let uploadAgo = snapshot.2.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
-
-        // No encode + no upload yet (first ~10s of a session) — don't
-        // alarm. Only classify once we've actually seen one of each, or
-        // we've been live long enough that absence is itself the signal.
-        let neverEncoded = snapshot.1 == nil
-        let neverUploaded = snapshot.2 == nil
-        if neverEncoded && neverUploaded { return }
+        // Absence of the first segment/upload ages from session start.
+        // Infinity both hid sessions with no audio forever and trapped when
+        // the first encode preceded the first upload (Int(infinity)).
+        let encodeAgo = max(0, now.timeIntervalSince(snapshot.1 ?? since))
+        let uploadAgo = max(0, now.timeIntervalSince(snapshot.2 ?? since))
 
         let (newHealth, reason): (LiveStreamHealth, String) = {
             if encodeAgo >= HealthThresholds.failingStaleSeconds {

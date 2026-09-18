@@ -163,6 +163,7 @@ public actor LiveStreamClient {
         }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
+        request.timeoutInterval = config.requestTimeout
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         do {
             let (data, response) = try await transport.perform(request)
