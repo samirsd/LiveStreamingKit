@@ -274,6 +274,62 @@ public actor LiveStreamClient {
 
     // MARK: - Helpers
 
+    /// Exchange the signed-in account's active Pro entitlement for a bounded
+    /// playback grant. Public metadata alone never authorizes native audio.
+    public func fetchPlaybackGrant(sessionID: String) async throws -> LiveListenerPlaybackGrant {
+        struct GrantResponse: Decodable {
+            let master_playlist_url: URL
+            let expires_at: String
+            let expires_in: Double
+        }
+        var request: URLRequest
+        do {
+            request = try await buildRequest(
+                path: "/api/v1/livestream/sessions/\(sessionID)/playback/", method: "GET"
+            )
+        } catch LiveStreamError.notAuthenticated {
+            throw LiveListenerAccessError.authenticationRequired
+        }
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        try Task.checkCancellation()
+        let (data, response) = try await transport.perform(request)
+        try Task.checkCancellation()
+        if response.statusCode == 401 { throw LiveListenerAccessError.authenticationRequired }
+        if response.statusCode == 403,
+           let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           body["code"] as? String == "subscription_required" {
+            throw LiveListenerAccessError.subscriptionRequired
+        }
+        guard (200..<300).contains(response.statusCode) else { throw LiveListenerAccessError.unavailable }
+        guard let grant = try? JSONDecoder().decode(GrantResponse.self, from: data) else {
+            throw LiveListenerAccessError.invalidResponse
+        }
+        let playlist = grant.master_playlist_url
+        // The scoped token must stay on the configured API origin and exact
+        // requested session. Never hand an unexpected credential URL to a player.
+        guard playlist.scheme == config.ingestBaseURL.scheme,
+              playlist.host == config.ingestBaseURL.host,
+              playlist.port == config.ingestBaseURL.port,
+              playlist.user == nil, playlist.password == nil,
+              playlist.path == "/live/\(sessionID)/master.m3u8",
+              URLComponents(url: playlist, resolvingAgainstBaseURL: false)?.queryItems?
+                .contains(where: { $0.name == "playback_token" && !($0.value ?? "").isEmpty }) == true else {
+            throw LiveListenerAccessError.invalidResponse
+        }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let fractionalDate = formatter.date(from: grant.expires_at)
+        formatter.formatOptions = [.withInternetDateTime]
+        guard let expiration = fractionalDate ?? formatter.date(from: grant.expires_at),
+              expiration > Date(), grant.expires_in > 0, grant.expires_in.isFinite else {
+            throw LiveListenerAccessError.invalidResponse
+        }
+        return LiveListenerPlaybackGrant(
+            masterPlaylistURL: playlist,
+            expiresAt: min(expiration, Date().addingTimeInterval(grant.expires_in))
+        )
+    }
+
     private func buildRequest(path: String, method: String) async throws -> URLRequest {
         guard let url = URL(string: path, relativeTo: config.ingestBaseURL)?.absoluteURL else {
             throw LiveStreamError.invalidConfiguration("malformed ingest URL")
@@ -301,7 +357,7 @@ public actor LiveStreamClient {
         switch response.statusCode {
         case 200..<300:
             return
-        case 401, 403:
+        case 401:
             throw LiveStreamError.notAuthenticated
         case let code:
             let body = String(data: data, encoding: .utf8)

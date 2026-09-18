@@ -23,6 +23,18 @@ The session itself is a durable multitrack recording. The livestream is a tempor
 - `LiveStreamClient` — auth-aware HTTP client for the livestream backend.
 - `AudioBufferObserver` — protocol RecordKit fires per-buffer; `LiveStreamEngine` conforms.
 
+### Authorized listening
+
+`LiveStreamClient.fetchPlaybackGrant(sessionID:)` sends the account bearer token to
+`GET /api/v1/livestream/sessions/<id>/playback/`. Active Pro access returns a
+`LiveListenerPlaybackGrant` containing the server's scoped HLS URL and expiration.
+Use that URL directly; constructing an unsigned playlist URL bypasses this contract
+and the server rejects it. Do not log or share playback-grant URLs.
+
+Handle `LiveListenerAccessError.authenticationRequired` with sign-in and
+`.subscriptionRequired` with listening subscription options. Public status and
+reaction requests remain anonymous and never authorize playback.
+
 ### Engagement events
 
 While a session is live, the engine spins up a `LiveStreamSocialPoller` that watches the backend for listener and reaction activity. It emits these `LiveStreamEvent` cases:
