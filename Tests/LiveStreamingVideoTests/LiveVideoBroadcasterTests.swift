@@ -24,6 +24,34 @@ private actor SuspendedVideoSink: LiveVideoSegmentSink {
     func release() { continuation?.resume(); continuation = nil }
 }
 
+
+// Observes the actual public stopping transition and attempts a competing start
+// at that admission boundary. No camera, microphone, fake writer, or copied state
+// machine is involved. The broadcaster's recursive lock permits this synchronous
+// callback to reenter start(), so its terminal reservation must already hold.
+private final class IdleStopAdmissionProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var broadcaster: LiveVideoBroadcaster?
+    private var attempted = 0
+    private var rejected = 0
+    private var recorded = false
+
+    func bind(_ value: LiveVideoBroadcaster) { lock.withLock { broadcaster = value } }
+    func receive(_ event: LiveVideoEvent) {
+        if event == .stateChanged(.recording) { lock.withLock { recorded = true } }
+        guard event == .stateChanged(.stopping), let owner = lock.withLock({ broadcaster }) else { return }
+        var refused = false
+        do { try owner.start(at: CMTime(seconds: 100, preferredTimescale: 48_000)) }
+        catch let error as LiveVideoError {
+            if case .invalidState = error { refused = true }
+        } catch {}
+        lock.withLock { attempted += 1; if refused { rejected += 1 } }
+    }
+    var result: (attempted: Int, rejected: Int, recorded: Bool) {
+        lock.withLock { (attempted, rejected, recorded) }
+    }
+}
+
 final class LiveVideoBroadcasterTests: XCTestCase, @unchecked Sendable {
     private func temporaryParent() throws -> URL {
         let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -100,6 +128,27 @@ final class LiveVideoBroadcasterTests: XCTestCase, @unchecked Sendable {
         }
         XCTAssertNotNil(broadcaster.archiveError)
         XCTAssertTrue(events.values.contains { if case .archiveFailed = $0 { return true }; return false })
+    }
+
+
+    func testIdleStopReservesTerminalStateBeforeACompetingStartCanBeAdmitted() async throws {
+        let probe = IdleStopAdmissionProbe()
+        let broadcaster = try LiveVideoBroadcaster(
+            archiveParentDirectory: temporaryParent(), onEvent: probe.receive
+        )
+        probe.bind(broadcaster)
+        do {
+            try await broadcaster.stop()
+            XCTFail("Stopping an unstarted take must retain its invalid-state result")
+        } catch let error as LiveVideoError {
+            guard case .invalidState = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+        let observed = probe.result
+        XCTAssertEqual(observed.attempted, 1, "Idle stop must publish its reservation before asynchronous finalization")
+        XCTAssertEqual(observed.rejected, 1, "A start at the stop boundary must be rejected")
+        XCTAssertFalse(observed.recorded)
+        guard case .failed = broadcaster.state else { return XCTFail("Idle stop is terminal") }
+        XCTAssertThrowsError(try broadcaster.start())
     }
 
     func testMissingDestinationsAndRestartAreRejected() async throws {
