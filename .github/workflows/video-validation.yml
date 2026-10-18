@@ -1,30 +1,98 @@
 name: Video validation
 on:
   pull_request:
-    paths: ['Sources/LiveStreamingVideo/**', 'Tests/LiveStreamingVideoTests/**', 'Validation/LiveStreamingVideo/**', 'Package.swift', '.github/workflows/video-validation.yml']
+    paths: ['Sources/LiveStreamingVideo/**', 'Tests/LiveStreamingVideoTests/**', 'Validation/LiveStreamingVideo/**', 'Sources/LiveStreamingKit/**', 'Tests/LiveStreamingKitTests/**', 'Package.swift', '.github/scripts/prepare-package-workspace.sh', '.github/workflows/video-validation.yml']
   push:
-    paths: ['Sources/LiveStreamingVideo/**', 'Tests/LiveStreamingVideoTests/**', 'Validation/LiveStreamingVideo/**', 'Package.swift', '.github/workflows/video-validation.yml']
+    paths: ['Sources/LiveStreamingVideo/**', 'Tests/LiveStreamingVideoTests/**', 'Validation/LiveStreamingVideo/**', 'Sources/LiveStreamingKit/**', 'Tests/LiveStreamingKitTests/**', 'Package.swift', '.github/scripts/prepare-package-workspace.sh', '.github/workflows/video-validation.yml']
 permissions:
   contents: read
 jobs:
   video:
-    runs-on: macos-latest
+    runs-on: [self-hosted, macOS, ARM64, carnyx, carnyx-canonical-remote-v1]
     timeout-minutes: 15
+    env:
+      USE_LOCAL_PACKAGES: "0"
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prepare isolated workspace
+        run: bash .github/scripts/prepare-package-workspace.sh
+      - name: Test complete audio and video package
+        run: |
+          set -euo pipefail
+          cd "${CI_REPO_ROOT}"
+          swift test --jobs 2 \
+            --scratch-path "${CI_SCRATCH_PATH}" \
+            --cache-path "${CI_CACHE_PATH}" \
+            --config-path "${CI_CONFIG_PATH}" \
+            --security-path "${CI_SECURITY_PATH}"
       - name: Encode, decode, and verify failure handling
-        run: swift test --package-path Validation/LiveStreamingVideo
+        working-directory: ${{ env.CI_REPO_ROOT }}
+        run: swift test --package-path Validation/LiveStreamingVideo --jobs 2
       - name: Compile for iPad
+        working-directory: ${{ env.CI_REPO_ROOT }}
         run: >-
           xcrun swiftc -swift-version 6 -target arm64-apple-ios18.0
           -sdk "$(xcrun --sdk iphoneos --show-sdk-path)"
           -module-name LiveStreamingVideo -parse-as-library -emit-module
-          -emit-module-path "$RUNNER_TEMP/LiveStreamingVideo-iOS.swiftmodule"
+          -emit-module-path "$CI_RUN_ROOT/LiveStreamingVideo-iOS.swiftmodule"
           Sources/LiveStreamingVideo/*.swift Sources/LiveStreamingVideo/Models/*.swift
       - name: Compile for Mac Catalyst
+        working-directory: ${{ env.CI_REPO_ROOT }}
         run: >-
           xcrun swiftc -swift-version 6 -target arm64-apple-ios18.0-macabi
           -sdk "$(xcrun --sdk macosx --show-sdk-path)"
           -module-name LiveStreamingVideo -parse-as-library -emit-module
-          -emit-module-path "$RUNNER_TEMP/LiveStreamingVideo-Catalyst.swiftmodule"
+          -emit-module-path "$CI_RUN_ROOT/LiveStreamingVideo-Catalyst.swiftmodule"
           Sources/LiveStreamingVideo/*.swift Sources/LiveStreamingVideo/Models/*.swift
+      - name: Preserve resolved graph metadata before cleanup
+        if: always()
+        env:
+          PRIOR_JOB_STATUS: ${{ job.status }}
+        run: |
+          python3 -I -S -B - <<'PY_GRAPH'
+          import hashlib, json, os, re, subprocess
+          from pathlib import Path
+          record = {"kind": "live-resolved-graph-v1", "priorJobStatus": os.environ["PRIOR_JOB_STATUS"], "complete": False}
+          def safe_urls(value):
+              if isinstance(value, dict): return all(safe_urls(item) for item in value.values())
+              if isinstance(value, list): return all(safe_urls(item) for item in value)
+              if isinstance(value, str) and ("://" in value or value.startswith("git@")):
+                  return bool(re.fullmatch(r"(?:https://github[.]com/|git@github[.]com:)[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value))
+              return True
+          try:
+              root = Path(os.environ["CI_REPO_ROOT"])
+              checkouts = Path(os.environ["CI_SCRATCH_PATH"]) / "checkouts"
+              lock_bytes = (root / "Package.resolved").read_bytes()
+              lock = json.loads(lock_bytes)
+              if not safe_urls(lock): raise ValueError("unsafe lock URL")
+              pins = lock.get("pins", lock.get("object", {}).get("pins", []))
+              if not isinstance(pins, list) or not pins: raise ValueError("missing pins")
+              record.update(lock=lock, lockSHA256=hashlib.sha256(lock_bytes).hexdigest())
+              rows = []
+              env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+              def git(path, *args):
+                  return subprocess.run(["git", "-C", str(path), *args], env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+              for path in sorted(checkouts.iterdir()):
+                  if path.is_symlink() or not path.is_dir() or not re.fullmatch(r"[A-Za-z0-9_.-]+", path.name): raise ValueError("invalid checkout")
+                  head = git(path, "rev-parse", "--verify", "HEAD").decode().strip()
+                  tree = git(path, "rev-parse", "--verify", "HEAD^{tree}").decode().strip()
+                  if not re.fullmatch(r"[0-9a-f]{40}", head) or not re.fullmatch(r"[0-9a-f]{40}", tree): raise ValueError("invalid Git identity")
+                  rows.append({"name": path.name, "head": head, "tree": tree,
+                               "manifestSHA256": hashlib.sha256((path / "Package.swift").read_bytes()).hexdigest(),
+                               "clean": not bool(git(path, "status", "--porcelain=v1", "-z", "--untracked-files=all"))})
+              record.update(checkouts=rows, complete=bool(rows) and all(row["clean"] for row in rows))
+          except Exception as error:
+              record["unavailableReason"] = type(error).__name__
+          print("LIVE_RESOLVED_GRAPH=" + json.dumps(record, sort_keys=True, separators=(",", ":")), flush=True)
+          if record["priorJobStatus"] == "success" and not record["complete"]:
+              raise SystemExit("Successful stages require a complete clean resolved graph record.")
+          PY_GRAPH
+      - name: Cleanup isolated workspace
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${CI_RUN_ROOT:-}" ] && [ -d "${CI_RUN_ROOT}" ]; then
+            rm -rf "${CI_RUN_ROOT}"
+          fi

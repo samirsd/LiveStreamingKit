@@ -97,7 +97,7 @@ public final class LiveVideoBroadcaster: @unchecked Sendable {
         if !drainDelivery { await delivery?.cancel() }
         let task: Task<Void, Error> = lock.withLock {
             if let stopTask { return stopTask }
-            if currentState == .recording {
+            if currentState == .idle || currentState == .recording {
                 currentState = .stopping
                 onEvent(.stateChanged(.stopping))
             }
