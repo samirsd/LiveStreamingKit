@@ -423,7 +423,19 @@ public final class FragmentedMP4Writer: NSObject, @unchecked Sendable {
             }
             let sequence = mediaSequence
             mediaSequence += 1
-            onSegment(LiveVideoSegment(kind: .media, sequence: sequence, data: data, duration: duration))
+            let timings = report?.trackReports.compactMap { track -> LiveVideoTrackTiming? in
+                let time = track.earliestPresentationTimeStamp
+                guard time.isNumeric, time.seconds.isFinite else { return nil }
+                let mediaType: LiveVideoMediaType
+                switch track.mediaType {
+                case .video: mediaType = .video
+                case .audio: mediaType = .audio
+                default: return nil
+                }
+                return LiveVideoTrackTiming(trackID: track.trackID, mediaType: mediaType,
+                                            presentationTimeValue: time.value, presentationTimescale: time.timescale)
+            } ?? []
+            onSegment(LiveVideoSegment(kind: .media, sequence: sequence, data: data, duration: duration, trackTimings: timings))
         @unknown default:
             fail(.encodingFailed("The encoder emitted an unsupported fragment type."))
         }

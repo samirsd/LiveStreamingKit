@@ -51,8 +51,24 @@ public struct LiveVideoConfiguration: Sendable, Equatable {
     }
 }
 
-public enum LiveVideoMediaType: String, Sendable, Equatable {
+public enum LiveVideoMediaType: String, Sendable, Equatable, Codable {
     case audio, video
+}
+
+/// Original encoded track time, before a file reader normalizes HLS tracks.
+public struct LiveVideoTrackTiming: Sendable, Equatable, Codable {
+    public let trackID: Int32
+    public let mediaType: LiveVideoMediaType
+    public let presentationTimeValue: Int64
+    public let presentationTimescale: Int32
+
+    public init(trackID: Int32, mediaType: LiveVideoMediaType,
+                presentationTimeValue: Int64, presentationTimescale: Int32) {
+        self.trackID = trackID
+        self.mediaType = mediaType
+        self.presentationTimeValue = presentationTimeValue
+        self.presentationTimescale = presentationTimescale
+    }
 }
 
 public struct LiveVideoSegment: Sendable, Equatable {
@@ -62,12 +78,15 @@ public struct LiveVideoSegment: Sendable, Equatable {
     public let sequence: Int
     public let data: Data
     public let duration: TimeInterval
+    public let trackTimings: [LiveVideoTrackTiming]
 
-    public init(kind: Kind, sequence: Int, data: Data, duration: TimeInterval = 0) {
+    public init(kind: Kind, sequence: Int, data: Data, duration: TimeInterval = 0,
+                trackTimings: [LiveVideoTrackTiming] = []) {
         self.kind = kind
         self.sequence = sequence
         self.data = data
         self.duration = duration
+        self.trackTimings = trackTimings
     }
 
     public var fileName: String {
