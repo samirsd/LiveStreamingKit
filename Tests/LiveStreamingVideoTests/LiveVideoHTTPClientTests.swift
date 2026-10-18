@@ -143,6 +143,74 @@ final class LiveVideoHTTPClientTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(requests.count, 1)
     }
 
+    private let expiredStorageXML = "<?xml version='1.0' encoding='UTF-8'?><Error><Code>ExpiredToken</Code><Message>Request has expired</Message></Error>"
+
+    func testGCSExpiredToken400ReauthorizesSameBytesAndCompletesVerifiedCommit() async throws {
+        let fixture = VideoHTTPFixture([.init(200, try grant()), .init(400, expiredStorageXML),
+                                       .init(200, try grant(upload: "https://storage.example/private/segment.m4s?signature=renewed")),
+                                       .init(200), .init(201)])
+        let data = Data("retained-fragment".utf8)
+        try await client(fixture).sink(for: session()).send(.init(kind: .media, sequence: 0, data: data, duration: 2))
+        let requests = await fixture.requests
+        XCTAssertEqual(requests.map(\.httpMethod), ["POST", "PUT", "POST", "PUT", "POST"])
+        XCTAssertEqual(requests[0].httpBody, requests[2].httpBody)
+        XCTAssertEqual(requests[1].httpBody, requests[3].httpBody)
+        XCTAssertNotEqual(requests[1].url, requests[3].url)
+        XCTAssertNil(requests[3].value(forHTTPHeaderField: "Authorization"))
+        XCTAssertNil(requests[3].value(forHTTPHeaderField: "X-Ingest-Token"))
+        XCTAssertTrue(requests[4].url!.path.hasSuffix("/commit"))
+    }
+
+    func testUnrelatedStorage400DoesNotRetryEvenIfMessageMentionsExpiredToken() async throws {
+        let body = "<Error><Code>InvalidArgument</Code><Message>ExpiredToken is not this error</Message></Error>"
+        let fixture = VideoHTTPFixture([.init(200, try grant()), .init(400, body)])
+        do {
+            try await client(fixture).sink(for: session()).send(.init(kind: .initialization, sequence: 0, data: Data([1])))
+            XCTFail("Permanent storage errors must not renew grants")
+        } catch { XCTAssertEqual(error as? LiveVideoHTTPError, .rejected(statusCode: 400)) }
+        let requests = await fixture.requests
+        XCTAssertEqual(requests.count, 2)
+    }
+
+    func testMalformedOversizedOrNonGCSErrorBodiesNeverRenewStorageGrant() async throws {
+        for body in ["<Error><Code>ExpiredToken</Code>",
+                     "<html><Code>ExpiredToken</Code></html>",
+                     "<Error><Code>InvalidArgument</Code><Code>ExpiredToken</Code></Error>",
+                     "<Error><Code><Nested>ExpiredToken</Nested></Code></Error>",
+                     String(repeating: " ", count: 8_192) + expiredStorageXML,
+                     "<!DOCTYPE Error [<!ENTITY code 'ExpiredToken'>]><Error><Code>&code;</Code></Error>"] {
+            let fixture = VideoHTTPFixture([.init(200, try grant()), .init(400, body)])
+            do {
+                try await client(fixture).sink(for: session()).send(.init(kind: .initialization, sequence: 0, data: Data([1])))
+                XCTFail("Only bounded, valid storage expiry errors can renew a grant")
+            } catch { XCTAssertEqual(error as? LiveVideoHTTPError, .rejected(statusCode: 400)) }
+            let requests = await fixture.requests
+            XCTAssertEqual(requests.count, 2)
+        }
+    }
+
+    func testExpiredTokenBodyFromControl400IsNeverRetried() async throws {
+        let fixture = VideoHTTPFixture([.init(400, expiredStorageXML)])
+        do {
+            try await client(fixture).sink(for: session()).send(.init(kind: .initialization, sequence: 0, data: Data([1])))
+            XCTFail("Control denials must not be treated as expired storage grants")
+        } catch { XCTAssertEqual(error as? LiveVideoHTTPError, .rejected(statusCode: 400)) }
+        let requests = await fixture.requests
+        XCTAssertEqual(requests.count, 1)
+    }
+
+    func testRepeatedStorageExpiredToken400HasBoundedRenewalAttempts() async throws {
+        var replies: [VideoHTTPFixture.Reply] = []
+        for _ in 0..<3 { replies += [.init(200, try grant()), .init(400, expiredStorageXML)] }
+        let fixture = VideoHTTPFixture(replies)
+        do {
+            try await client(fixture).sink(for: session()).send(.init(kind: .initialization, sequence: 0, data: Data([1])))
+            XCTFail("A persistently expired grant must terminate bounded retries")
+        } catch { XCTAssertEqual(error as? LiveVideoHTTPError, .expiredUpload) }
+        let requests = await fixture.requests
+        XCTAssertEqual(requests.count, 6)
+    }
+
     func testUnsafeStorageAndForeignCommitAddressesAreRejectedBeforeSendingBytes() async throws {
         for (upload, commit) in [("file:///tmp/destination", "/api/v1/livestream/sessions/abc-123/uploads/u/commit/"),
                                  ("http://storage.example/file", "/api/v1/livestream/sessions/abc-123/uploads/u/commit/"),

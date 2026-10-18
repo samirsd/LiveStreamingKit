@@ -1,5 +1,8 @@
 import Foundation
 import CryptoKit
+#if canImport(FoundationXML)
+import FoundationXML
+#endif
 
 /// Separate from the audio-only client: video is enabled only by an explicit
 /// server capability and its media bytes never pass through the control API.
@@ -122,11 +125,13 @@ public actor LiveVideoHTTPClient {
                 upload.setValue(value, forHTTPHeaderField: name)
             }
             upload.httpBody = segment.data
-            let (_, response) = try await self.transport.perform(upload)
+            let (storageBody, response) = try await self.transport.perform(upload)
             // A lost commit acknowledgement can cause another immutable PUT.
             // Its precondition failure must still be reconciled by the server.
             if response.statusCode != 412 {
-                if response.statusCode == 403 { throw LiveVideoHTTPError.expiredUpload }
+                if response.statusCode == 403 || Self.isExpiredStorageGrant(response, body: storageBody) {
+                    throw LiveVideoHTTPError.expiredUpload
+                }
                 try self.ensureSuccess(response)
             }
             var commit = try self.request(url: commitURL, method: "POST", control: true)
@@ -181,6 +186,21 @@ public actor LiveVideoHTTPClient {
             if response.statusCode == 401 { throw LiveVideoHTTPError.notAuthenticated }
             throw LiveVideoHTTPError.rejected(statusCode: response.statusCode)
         }
+    }
+
+    private static func isExpiredStorageGrant(_ response: HTTPURLResponse, body: Data) -> Bool {
+        // GCS can return HTTP400 + ExpiredToken for an expired V4 capability.
+        // Inspect only a small, valid XML error from the storage PUT response;
+        // unrelated400s and all control-API rejections remain permanent. Never
+        // log response bodies, which may contain the signed request address.
+        guard response.statusCode == 400, body.count <= 8_192,
+              let xml = String(data: body, encoding: .utf8),
+              !xml.contains("\0"), !xml.contains("<!") else { return false }
+        let delegate = VideoStorageErrorCodeParser()
+        let parser = XMLParser(data: body)
+        parser.shouldResolveExternalEntities = false
+        parser.delegate = delegate
+        return parser.parse() && delegate.isExpiredToken
     }
 
     private func retry<T>(_ operation: () async throws -> T) async throws -> T {
@@ -315,4 +335,52 @@ private struct UploadGrant: Decodable {
     let method: String
     let headers: [String: String]
     let commit_url: String
+}
+
+/// Reads only one direct Error/Code value, without accepting entity declarations
+/// or misleading occurrences in a message, nested element, or duplicate code.
+private final class VideoStorageErrorCodeParser: NSObject, XMLParserDelegate {
+    private var depth = 0
+    private var rootIsError = false
+    private var readingCode = false
+    private var code: String?
+    private var invalid = false
+
+    var isExpiredToken: Bool {
+        !invalid && rootIsError && code?.trimmingCharacters(in: .whitespacesAndNewlines) == "ExpiredToken"
+    }
+
+    func parser(_ parser: XMLParser, didStartElement elementName: String,
+                namespaceURI: String?, qualifiedName qName: String?, attributes attributeDict: [String: String]) {
+        depth += 1
+        if depth == 1 { rootIsError = elementName == "Error" }
+        if readingCode {
+            invalid = true
+            parser.abortParsing()
+        } else if rootIsError && depth == 2 && elementName == "Code" {
+            guard code == nil else {
+                invalid = true
+                parser.abortParsing()
+                return
+            }
+            code = ""
+            readingCode = true
+        }
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        guard readingCode else { return }
+        guard (code?.utf8.count ?? 0) + string.utf8.count <= 64 else {
+            invalid = true
+            parser.abortParsing()
+            return
+        }
+        code?.append(string)
+    }
+
+    func parser(_ parser: XMLParser, didEndElement elementName: String,
+                namespaceURI: String?, qualifiedName qName: String?) {
+        if depth == 2 && elementName == "Code" { readingCode = false }
+        depth -= 1
+    }
 }

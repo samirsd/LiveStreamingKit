@@ -98,6 +98,8 @@ let broadcaster = try LiveVideoBroadcaster(configuration: configuration,
 
 Private media URLs in a playlist expire independently of its playback grant. `LiveListenerPlaybackGrant.mediaURLRefreshAfterSeconds` tells players when to reauthorize/reload, preserving replay position and pause state. Legacy audio responses omit this property and retain their existing behavior. This is buffered broadcast HLS, with an initial application target of approximately 10–20 seconds, not a subsecond interactive transport. Preserve the existing audio endpoint and keep video disabled until the matching backend/player and actual hardware are qualified.
 
+For direct publishing, a storage PUT403 or a bounded valid GCS XML400 with `Error/Code=ExpiredToken` renews the upload grant and retries the exact same bytes/metadata within the configured attempt limit. Other400 errors and control-API denials remain permanent. Error bodies and signed addresses are never logged. HTTP412 still requires a successful verified commit before delivery is acknowledged.
+
 ## Verification
 
 ```
