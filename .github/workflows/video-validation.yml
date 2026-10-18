@@ -1,0 +1,30 @@
+name: Video validation
+on:
+  pull_request:
+    paths: ['Sources/LiveStreamingVideo/**', 'Tests/LiveStreamingVideoTests/**', 'Validation/LiveStreamingVideo/**', 'Package.swift', '.github/workflows/video-validation.yml']
+  push:
+    paths: ['Sources/LiveStreamingVideo/**', 'Tests/LiveStreamingVideoTests/**', 'Validation/LiveStreamingVideo/**', 'Package.swift', '.github/workflows/video-validation.yml']
+permissions:
+  contents: read
+jobs:
+  video:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Encode, decode, and verify failure handling
+        run: swift test --package-path Validation/LiveStreamingVideo
+      - name: Compile for iPad
+        run: >-
+          xcrun swiftc -swift-version 6 -target arm64-apple-ios18.0
+          -sdk "$(xcrun --sdk iphoneos --show-sdk-path)"
+          -module-name LiveStreamingVideo -parse-as-library -emit-module
+          -emit-module-path "$RUNNER_TEMP/LiveStreamingVideo-iOS.swiftmodule"
+          Sources/LiveStreamingVideo/*.swift Sources/LiveStreamingVideo/Models/*.swift
+      - name: Compile for Mac Catalyst
+        run: >-
+          xcrun swiftc -swift-version 6 -target arm64-apple-ios18.0-macabi
+          -sdk "$(xcrun --sdk macosx --show-sdk-path)"
+          -module-name LiveStreamingVideo -parse-as-library -emit-module
+          -emit-module-path "$RUNNER_TEMP/LiveStreamingVideo-Catalyst.swiftmodule"
+          Sources/LiveStreamingVideo/*.swift Sources/LiveStreamingVideo/Models/*.swift
