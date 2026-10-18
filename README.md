@@ -1,5 +1,12 @@
 # LiveStreamingKit
 
+Opt-in camera support is available in the separate dependency-free
+`LiveStreamingVideo` product. It encodes timestamped camera frames and mixed PCM
+audio into H.264/AAC fMP4, saves a recoverable HLS archive, and delivers ordered
+segments through a video-capable sink. See [video integration and limitations](Docs/VideoStreaming.md).
+Existing audio streaming is unchanged; the current backend still requires a
+separate video ingest/player integration before this can be enabled in Carnyx.
+
 Live-native multitrack audio streaming for Carnyx. While `RecordKit` writes isolated stems to disk, `LiveStreamingKit` taps the same input buffers, downmixes to stereo, encodes AAC, packs HLS segments, and uploads them to the mixtape backend — all from the same capture event.
 
 ## Overview

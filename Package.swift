@@ -29,6 +29,7 @@ let package = Package(
             name: "LiveStreamingKit",
             targets: ["LiveStreamingKit"]
         ),
+        .library(name: "LiveStreamingVideo", targets: ["LiveStreamingVideo"]),
     ],
     dependencies: [
         useLocalDependencies ?
@@ -39,6 +40,8 @@ let package = Package(
             .package(url: "https://github.com/samirsd/LoggingKit.git", from: "1.0.11"),
     ],
     targets: [
+        .target(name: "LiveStreamingVideo"),
+        .testTarget(name: "LiveStreamingVideoTests", dependencies: ["LiveStreamingVideo"]),
         .target(
             name: "LiveStreamingKit",
             dependencies: ["AIMixKit", "LoggingKit"]
