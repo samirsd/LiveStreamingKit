@@ -46,6 +46,27 @@ public struct SessionStatusResponse: Codable, Sendable {
     public let total_listeners: Int?
     public let peak_listener_count: Int?
     public let reaction_totals: [String: Int]?
+    public let media_type: String?
+    public let video_width: Int?
+    public let video_height: Int?
+    public let video_frame_rate: Int?
+    public let video_bitrate: Int?
+
+    public init(status: String, listener_count: Int? = nil, total_listeners: Int? = nil,
+                peak_listener_count: Int? = nil, reaction_totals: [String: Int]? = nil,
+                media_type: String? = nil, video_width: Int? = nil, video_height: Int? = nil,
+                video_frame_rate: Int? = nil, video_bitrate: Int? = nil) {
+        self.status = status
+        self.listener_count = listener_count
+        self.total_listeners = total_listeners
+        self.peak_listener_count = peak_listener_count
+        self.reaction_totals = reaction_totals
+        self.media_type = media_type
+        self.video_width = video_width
+        self.video_height = video_height
+        self.video_frame_rate = video_frame_rate
+        self.video_bitrate = video_bitrate
+    }
 }
 
 public struct ReactionsResponse: Codable, Sendable {
@@ -281,6 +302,7 @@ public actor LiveStreamClient {
             let master_playlist_url: URL
             let expires_at: String
             let expires_in: Double
+            let media_url_refresh_after_seconds: Double?
         }
         var request: URLRequest
         do {
@@ -324,9 +346,14 @@ public actor LiveStreamClient {
               expiration > Date(), grant.expires_in > 0, grant.expires_in.isFinite else {
             throw LiveListenerAccessError.invalidResponse
         }
+        if let refresh = grant.media_url_refresh_after_seconds,
+           (!refresh.isFinite || refresh <= 0 || refresh >= grant.expires_in) {
+            throw LiveListenerAccessError.invalidResponse
+        }
         return LiveListenerPlaybackGrant(
             masterPlaylistURL: playlist,
-            expiresAt: min(expiration, Date().addingTimeInterval(grant.expires_in))
+            expiresAt: min(expiration, Date().addingTimeInterval(grant.expires_in)),
+            mediaURLRefreshAfterSeconds: grant.media_url_refresh_after_seconds
         )
     }
 

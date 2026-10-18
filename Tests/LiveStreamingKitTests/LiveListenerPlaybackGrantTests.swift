@@ -67,10 +67,36 @@ final class LiveListenerPlaybackGrantTests: XCTestCase {
         } catch { XCTFail("Wrong broadcaster failure: \(error)") }
     }
 
+    func testPrivateVideoMediaRenewalIsDecodedAndInvalidIntervalsAreRejected() async throws {
+        let url = "https://example.test/live/session/master.m3u8?playback_token=bounded-grant"
+        let valid = MockTransport()
+        await valid.queueJSON(Response(master_playlist_url: url, expires_at: "2099-01-01T00:00:00Z",
+                                       expires_in: 43200, media_url_refresh_after_seconds: 120), statusCode: 200)
+        let grant = try await client(valid).fetchPlaybackGrant(sessionID: "session")
+        XCTAssertEqual(grant.mediaURLRefreshAfterSeconds, 120)
+        for interval in [0.0, -1, 43200, 90000] {
+            let invalid = MockTransport()
+            await invalid.queueJSON(Response(master_playlist_url: url, expires_at: "2099-01-01T00:00:00Z",
+                                              expires_in: 43200, media_url_refresh_after_seconds: interval), statusCode: 200)
+            await assertError(.invalidResponse) { try await self.client(invalid).fetchPlaybackGrant(sessionID: "session") }
+        }
+    }
+
+    func testSessionMetadataDecodesLegacyAudioAndPortraitVideo() throws {
+        let decoder = JSONDecoder()
+        let legacy = try decoder.decode(SessionStatusResponse.self, from: Data("{\"status\":\"live\"}".utf8))
+        XCTAssertNil(legacy.media_type)
+        let video = try decoder.decode(SessionStatusResponse.self, from: Data("{\"status\":\"ended\",\"media_type\":\"video\",\"video_width\":720,\"video_height\":1280}".utf8))
+        XCTAssertEqual(video.media_type, "video")
+        XCTAssertEqual(video.video_width, 720)
+        XCTAssertEqual(video.video_height, 1280)
+    }
+
     private struct Response: Encodable {
         let master_playlist_url: String
         let expires_at: String
         let expires_in: Int
+        var media_url_refresh_after_seconds: Double? = nil
     }
 
     private func response(url: String, expires: String = "2099-01-01T00:00:00.000Z") -> Response {

@@ -81,7 +81,22 @@ Repeated `stop()` calls share finalization. `stop(drainDelivery: false)` cancels
 
 The deployed audio ingest contract accepts AAC/ADTS and serves `.aac` files. **It does not support this video output.** There is deliberately no adapter that sends MP4 bytes through `LiveStreamClient` or merely changes its `codec` string.
 
-Before enabling video in Carnyx, add a capability-negotiated server contract with initialization upload/acknowledgment, immutable media sequence uploads, `video/mp4` serving, H.264/AAC metadata and combined bitrate, `EXT-X-MAP` manifests, and video listener UI. Implement `LiveVideoSegmentSink` only against that contract. Preserve the existing audio endpoint and keep video behind an app feature flag until integration and device qualification pass.
+`LiveVideoHTTPClient` implements the new opt-in `direct-upload-v1` contract. It requires the server's `h264-aac-fmp4-v1` capability before creating a video session. Each initialization/media object is authorized with its exact byte count and SHA-256, uploaded directly to private storage with the returned immutable-write headers, then committed through the API. A segment is acknowledged only after server verification. Retries reconcile an already-uploaded object after a lost response; conflicts and revoked permissions fail permanently. Account/ingest credentials never accompany the storage PUT, and automatic HTTP redirects are disabled.
+
+```swift
+let client = LiveVideoHTTPClient(configuration: .init(
+    baseURL: apiURL, authToken: { await account.accessToken }
+))
+let configuration = LiveVideoConfiguration(videoWidth: 720, videoHeight: 1280,
+    videoBitrate: 3_000_000, segmentDuration: 2)
+let session = try await client.createSession(video: configuration, title: "venue")
+let broadcaster = try LiveVideoBroadcaster(configuration: configuration,
+    archiveParentDirectory: leasedRecordingDirectory, sink: client.sink(for: session))
+```
+
+`LiveVideoFrameRenderer` center-crops camera frames into the exact encoder canvas without inventing a new clock. Use VideoCaptureKit's explicit rotation for a physically rotated camera; landscape sources remain upright and crop to portrait. The app must retain its recording destination lease through finalization and reacquire source access for later MP4 exports.
+
+Private media URLs in a playlist expire independently of its playback grant. `LiveListenerPlaybackGrant.mediaURLRefreshAfterSeconds` tells players when to reauthorize/reload, preserving replay position and pause state. Legacy audio responses omit this property and retain their existing behavior. This is buffered broadcast HLS, with an initial application target of approximately 10–20 seconds, not a subsecond interactive transport. Preserve the existing audio endpoint and keep video disabled until the matching backend/player and actual hardware are qualified.
 
 ## Verification
 
@@ -91,4 +106,4 @@ swift test --package-path Validation/LiveStreamingVideo
 
 The validation manifest references the same production sources and tests through relative symlinks, without resolving the unrelated audio dependency graph. Tests perform actual H.264/AAC encoding and decoding, inspect raw fragment timestamps, and simulate slow/failing delivery, unavailable storage, queue pressure, startup/stop, and input format/timing errors. Export tests decode the real media edits, verify ±250 ms audio correction without a ten-second lead-in, preserve source bytes, cancel an active copy, reject overwrites and exercise storage write failures. On macOS, an installed `ffprobe` also independently checks actual MP4 track start times. Set `LIVE_VIDEO_EXPORT_FIXTURE_DIRECTORY` to a fresh output directory to retain three offset fixtures for independent `ffprobe`/`ffmpeg` inspection. VideoCaptureKit has its own hardware-free test target and cross-platform compile checks.
 
-Still required before shipping the app feature: app audio host-time adapter, backend/player integration, external-directory permission UX, camera selection/preview UI, and sustained physical iPad/Mac tests. Test camera disconnect, SSD unplug/full volume, network outages, interruption/backgrounding, thermal load, frame drops, long-session drift, and measured lip sync on the actual powered hub/audio interface/camera/SSD rig. No synthetic test substitutes for that hardware qualification.
+The app integration and backend/player branches must be released together before enabling video. Sustained physical iPad/Mac qualification is still required: camera disconnect, SSD unplug/full volume, network outages, interruption/backgrounding, thermal load, frame drops, long-session drift, and measured lip sync on the actual powered hub/audio interface/camera/SSD rig. No synthetic test substitutes for that hardware qualification.
