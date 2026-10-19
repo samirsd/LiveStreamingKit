@@ -5,10 +5,14 @@ import Foundation
 public struct LiveListenerPlaybackGrant: Equatable, Sendable {
     public let masterPlaylistURL: URL
     public let expiresAt: Date
+    /// Video manifests embed short-lived private object URLs. Reauthorize before
+    /// these expire, including while watching an already-ended replay.
+    public let mediaURLRefreshAfterSeconds: TimeInterval?
 
-    public init(masterPlaylistURL: URL, expiresAt: Date) {
+    public init(masterPlaylistURL: URL, expiresAt: Date, mediaURLRefreshAfterSeconds: TimeInterval? = nil) {
         self.masterPlaylistURL = masterPlaylistURL
         self.expiresAt = expiresAt
+        self.mediaURLRefreshAfterSeconds = mediaURLRefreshAfterSeconds
     }
 }
 

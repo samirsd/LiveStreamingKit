@@ -58,7 +58,18 @@ Callbacks must return promptly and must not synchronously wait on another thread
 
 A fresh `Carnyx-LiveVideo-<UUID>` subdirectory contains `init.mp4`, sequential `segment-*.m4s` files, and `index.m3u8`. Existing files are never replaced. Each fragment is synchronized to storage before an atomic playlist update references it. Successful stop drains encoder output and adds `ENDLIST`; failed capture preserves the completed fragments and an open EVENT playlist.
 
-The archive is a standard **HLS bundle**, not a standalone shareable MP4. Preserve the complete directory. Offline playback integration and a timing-aware single-file export belong to the host's next integration step. Do not concatenate fragments and export them naively: Apple HLS uses a positive timestamp offset for AAC priming, and opening a concatenation as an ordinary MP4 can normalize tracks independently and discard their relative timing.
+The archive is a standard **HLS bundle**. Preserve the complete directory, including `timeline.json`, which records the original encoded track timestamps before AVFoundation normalizes them independently. After a successful stop, create a standalone shareable MP4 with:
+
+```swift
+let mp4URL = try await LiveVideoArchiveExporter.export(
+    archiveDirectory: broadcast.archiveDirectoryURL!,
+    to: selectedDirectory.appendingPathComponent("Performance.mp4")
+)
+```
+
+The exporter passes through H.264/AAC without re-encoding, restores relative track timing and the source's AAC priming edit, then removes one common timeline origin. Both positive and negative `audioOffset` corrections survive. Existing destination files are refused. Cancellation throws `CancellationError`; incomplete archives, missing fragments, unavailable storage and export failures throw `LiveVideoError.archiveFailed`. Failed attempts retain the original archive and remove only their own scratch directory. Keep directory access leases alive until export returns. Export currently needs temporary storage alongside the destination for a concatenation and the finished MP4: budget approximately twice the archive's size in additional free space.
+
+This is buffered HLS delivery, targeting roughly 10–20 seconds of end-to-end latency after app/server/player integration and measurement. It is not WebRTC or an interactive sub-second transport. A clip-on lens requires no special encoding behavior. For portrait capture, rotate the camera's actual buffers, configure the encoder with their resulting dimensions (for example 1080×1920), and keep orientation fixed throughout the take. The exporter preserves a source track transform but cannot correct an incorrectly oriented source.
 
 Network failure/overflow permanently stops that delivery lane and reports it; local archival continues. This prevents publishing media after an unrepresented sequence gap. A sink may implement bounded retries within `send`, and must honor cancellation. Initialization must be acknowledged before media; all calls are ordered. `deliveryError` remains readable even when the archive completes successfully.
 
@@ -70,7 +81,24 @@ Repeated `stop()` calls share finalization. `stop(drainDelivery: false)` cancels
 
 The deployed audio ingest contract accepts AAC/ADTS and serves `.aac` files. **It does not support this video output.** There is deliberately no adapter that sends MP4 bytes through `LiveStreamClient` or merely changes its `codec` string.
 
-Before enabling video in Carnyx, add a capability-negotiated server contract with initialization upload/acknowledgment, immutable media sequence uploads, `video/mp4` serving, H.264/AAC metadata and combined bitrate, `EXT-X-MAP` manifests, and video listener UI. Implement `LiveVideoSegmentSink` only against that contract. Preserve the existing audio endpoint and keep video behind an app feature flag until integration and device qualification pass.
+`LiveVideoHTTPClient` implements the new opt-in `direct-upload-v1` contract. It requires the server's `h264-aac-fmp4-v1` capability before creating a video session. Each initialization/media object is authorized with its exact byte count and SHA-256, uploaded directly to private storage with the returned immutable-write headers, then committed through the API. A segment is acknowledged only after server verification. Retries reconcile an already-uploaded object after a lost response; conflicts and revoked permissions fail permanently. Account/ingest credentials never accompany the storage PUT, and automatic HTTP redirects are disabled.
+
+```swift
+let client = LiveVideoHTTPClient(configuration: .init(
+    baseURL: apiURL, authToken: { await account.accessToken }
+))
+let configuration = LiveVideoConfiguration(videoWidth: 720, videoHeight: 1280,
+    videoBitrate: 3_000_000, segmentDuration: 2)
+let session = try await client.createSession(video: configuration, title: "venue")
+let broadcaster = try LiveVideoBroadcaster(configuration: configuration,
+    archiveParentDirectory: leasedRecordingDirectory, sink: client.sink(for: session))
+```
+
+`LiveVideoFrameRenderer` center-crops camera frames into the exact encoder canvas without inventing a new clock. Use VideoCaptureKit's explicit rotation for a physically rotated camera; landscape sources remain upright and crop to portrait. The app must retain its recording destination lease through finalization and reacquire source access for later MP4 exports.
+
+Private media URLs in a playlist expire independently of its playback grant. `LiveListenerPlaybackGrant.mediaURLRefreshAfterSeconds` tells players when to reauthorize/reload, preserving replay position and pause state. Legacy audio responses omit this property and retain their existing behavior. This is buffered broadcast HLS, with an initial application target of approximately 10–20 seconds, not a subsecond interactive transport. Preserve the existing audio endpoint and keep video disabled until the matching backend/player and actual hardware are qualified.
+
+For direct publishing, a storage PUT403 or a bounded valid GCS XML400 with `Error/Code=ExpiredToken` renews the upload grant and retries the exact same bytes/metadata within the configured attempt limit. Other400 errors and control-API denials remain permanent. Error bodies and signed addresses are never logged. HTTP412 still requires a successful verified commit before delivery is acknowledged.
 
 ## Verification
 
@@ -78,6 +106,6 @@ Before enabling video in Carnyx, add a capability-negotiated server contract wit
 swift test --package-path Validation/LiveStreamingVideo
 ```
 
-The validation manifest references the same production sources and tests through relative symlinks, without resolving the unrelated audio dependency graph. Tests perform actual H.264/AAC encoding and decoding, inspect raw fragment timestamps, and simulate slow/failing delivery, unavailable storage, queue pressure, startup/stop, and input format/timing errors. VideoCaptureKit has its own hardware-free test target and cross-platform compile checks.
+The validation manifest references the same production sources and tests through relative symlinks, without resolving the unrelated audio dependency graph. Tests perform actual H.264/AAC encoding and decoding, inspect raw fragment timestamps, and simulate slow/failing delivery, unavailable storage, queue pressure, startup/stop, and input format/timing errors. Export tests decode the real media edits, verify ±250 ms audio correction without a ten-second lead-in, preserve source bytes, cancel an active copy, reject overwrites and exercise storage write failures. On macOS, an installed `ffprobe` also independently checks actual MP4 track start times. Set `LIVE_VIDEO_EXPORT_FIXTURE_DIRECTORY` to a fresh output directory to retain three offset fixtures for independent `ffprobe`/`ffmpeg` inspection. VideoCaptureKit has its own hardware-free test target and cross-platform compile checks.
 
-Still required before shipping the app feature: app audio host-time adapter, backend/player integration, external-directory permission UX, camera selection/preview UI, and sustained physical iPad/Mac tests. Test camera disconnect, SSD unplug/full volume, network outages, interruption/backgrounding, thermal load, frame drops, long-session drift, and measured lip sync on the actual powered hub/audio interface/camera/SSD rig. No synthetic test substitutes for that hardware qualification.
+The app integration and backend/player branches must be released together before enabling video. Sustained physical iPad/Mac qualification is still required: camera disconnect, SSD unplug/full volume, network outages, interruption/backgrounding, thermal load, frame drops, long-session drift, and measured lip sync on the actual powered hub/audio interface/camera/SSD rig. No synthetic test substitutes for that hardware qualification.

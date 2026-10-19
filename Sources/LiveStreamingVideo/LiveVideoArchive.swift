@@ -12,6 +12,7 @@ final class LiveVideoArchive {
     private var initialized = false
     private var segments: [(fileName: String, duration: TimeInterval)] = []
     private var closed = false
+    private var firstTrackTimings: [LiveVideoTrackTiming] = []
 
     init(parentDirectory: URL, configuration: LiveVideoConfiguration) throws {
         try configuration.validate()
@@ -63,15 +64,30 @@ final class LiveVideoArchive {
             initialized = true
         } else {
             segments.append((segment.fileName, segment.duration))
+            for timing in segment.trackTimings where !firstTrackTimings.contains(where: { $0.trackID == timing.trackID }) {
+                firstTrackTimings.append(timing)
+            }
         }
-        if !segments.isEmpty { try writePlaylist(isClosed: false) }
+        if !segments.isEmpty {
+            try writeTimeline(completed: false)
+            try writePlaylist(isClosed: false)
+        }
     }
 
     /// Failed captures retain an open EVENT playlist and all completed fragments.
     func finish(success: Bool) throws {
         guard !closed else { return }
         closed = true
-        if !segments.isEmpty { try writePlaylist(isClosed: success) }
+        if !segments.isEmpty {
+            try writeTimeline(completed: success)
+            try writePlaylist(isClosed: success)
+        }
+    }
+
+    private func writeTimeline(completed: Bool) throws {
+        let timeline = LiveVideoArchiveTimeline(version: 1, completed: completed,
+                                                mediaSegmentCount: segments.count, trackTimings: firstTrackTimings)
+        try JSONEncoder().encode(timeline).write(to: directoryURL.appendingPathComponent("timeline.json"), options: .atomic)
     }
 
     private func writePlaylist(isClosed: Bool) throws {
@@ -87,4 +103,11 @@ final class LiveVideoArchive {
         if isClosed { lines.append("#EXT-X-ENDLIST") }
         try (lines.joined(separator: "\n") + "\n").write(to: playlistURL, atomically: true, encoding: .utf8)
     }
+}
+
+struct LiveVideoArchiveTimeline: Codable {
+    let version: Int
+    let completed: Bool
+    let mediaSegmentCount: Int
+    let trackTimings: [LiveVideoTrackTiming]
 }

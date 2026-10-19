@@ -3,6 +3,31 @@ import Foundation
 @preconcurrency import CoreMedia
 import UniformTypeIdentifiers
 
+/// Measures each fragment on the same rational presentation timeline. AAC packet
+/// boundaries can overlap a video's fragment boundary; summing the longest track
+/// duration repeatedly counts that overlap and makes an HLS playlist drift.
+struct FragmentPresentationTimeline {
+    private var publishedEnd: CMTime?
+
+    mutating func duration(for ranges: [CMTimeRange]) throws -> TimeInterval {
+        guard !ranges.isEmpty, ranges.allSatisfy({
+            $0.start.isNumeric && $0.start.seconds.isFinite &&
+            $0.duration.isNumeric && $0.duration.seconds.isFinite &&
+            CMTimeCompare($0.duration, .zero) > 0 &&
+            $0.end.isNumeric && $0.end.seconds.isFinite
+        }), let first = ranges.map(\.start).min(by: { CMTimeCompare($0, $1) < 0 }),
+            let end = ranges.map(\.end).max(by: { CMTimeCompare($0, $1) < 0 }) else {
+            throw LiveVideoError.encodingFailed("The encoder emitted a fragment without valid presentation timing.")
+        }
+        let elapsed = CMTimeSubtract(end, publishedEnd ?? first)
+        guard elapsed.isNumeric, elapsed.seconds.isFinite, CMTimeCompare(elapsed, .zero) > 0 else {
+            throw LiveVideoError.encodingFailed("The encoder emitted a fragment without advancing presentation time.")
+        }
+        publishedEnd = end
+        return elapsed.seconds
+    }
+}
+
 /// Encodes raw camera frames and PCM audio into one H.264/AAC fragmented MP4 stream.
 ///
 /// `hostTime` must identify the first sample in the buffer on the same monotonic clock
@@ -50,6 +75,7 @@ public final class FragmentedMP4Writer: NSObject, @unchecked Sendable {
     private var lastAudioTime: CMTime?
     private var lastAudioEndTime: CMTime?
     private var mediaSequence = 0
+    private var presentationTimeline = FragmentPresentationTimeline()
     private var sawInitialization = false
     private var appendedVideo = false
     private var appendedAudio = false
@@ -413,17 +439,39 @@ public final class FragmentedMP4Writer: NSObject, @unchecked Sendable {
                 fail(.encodingFailed("The encoder emitted media before MP4 initialization."))
                 return
             }
-            let durations = report?.trackReports.compactMap { track -> TimeInterval? in
-                let value = track.duration.seconds
-                return track.duration.isNumeric && value.isFinite && value > 0 ? value : nil
+            let ranges = report?.trackReports.compactMap { track -> CMTimeRange? in
+                guard track.mediaType == .video || track.mediaType == .audio else { return nil }
+                // A final audio-only fragment may still include a video report
+                // whose duration is invalid because it contains no video samples.
+                guard track.duration.isNumeric, track.duration.seconds.isFinite,
+                      CMTimeCompare(track.duration, .zero) > 0 else { return nil }
+                return CMTimeRange(start: track.earliestPresentationTimeStamp, duration: track.duration)
             } ?? []
-            guard let duration = durations.max() else {
-                fail(.encodingFailed("The encoder emitted a fragment without a valid media duration."))
+            let duration: TimeInterval
+            do {
+                duration = try presentationTimeline.duration(for: ranges)
+            } catch let error as LiveVideoError {
+                fail(error)
+                return
+            } catch {
+                fail(.encodingFailed("The encoder emitted invalid presentation timing."))
                 return
             }
             let sequence = mediaSequence
             mediaSequence += 1
-            onSegment(LiveVideoSegment(kind: .media, sequence: sequence, data: data, duration: duration))
+            let timings = report?.trackReports.compactMap { track -> LiveVideoTrackTiming? in
+                let time = track.earliestPresentationTimeStamp
+                guard time.isNumeric, time.seconds.isFinite else { return nil }
+                let mediaType: LiveVideoMediaType
+                switch track.mediaType {
+                case .video: mediaType = .video
+                case .audio: mediaType = .audio
+                default: return nil
+                }
+                return LiveVideoTrackTiming(trackID: track.trackID, mediaType: mediaType,
+                                            presentationTimeValue: time.value, presentationTimescale: time.timescale)
+            } ?? []
+            onSegment(LiveVideoSegment(kind: .media, sequence: sequence, data: data, duration: duration, trackTimings: timings))
         @unknown default:
             fail(.encodingFailed("The encoder emitted an unsupported fragment type."))
         }
